@@ -1,0 +1,9 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+/src/
+/docs/
+/.openapi-generator
+README.md
+git_push.sh
+Cargo.toml

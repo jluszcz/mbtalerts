@@ -1,0 +1,15 @@
+{
+  "inputSpec": "/Users/jacob/Documents/Programs/mbta-api/apps/api_web/priv/static/swagger.json",
+  "generatorName": "rust",
+  "outputDir": "src/mbta-client",
+  "additionalProperties": {
+    "library": "reqwest",
+    "packageName": "mbta_client",
+    "supportAsync": true,
+    "useSingleRequestParameter": true,
+    "skipOverwrite": [
+      "travis.yml",
+      ".gitignore"
+    ]
+  }
+}
