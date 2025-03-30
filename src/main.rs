@@ -5,7 +5,7 @@ use mbtalerts::set_up_logger;
 #[derive(Debug)]
 struct Args {
     verbose: bool,
-    _use_cache: bool,
+    use_cache: bool,
 }
 
 fn parse_args() -> Args {
@@ -32,17 +32,17 @@ fn parse_args() -> Args {
 
     let use_cache = matches.get_flag("use-cache");
 
-    Args {
-        verbose,
-        _use_cache: use_cache,
-    }
+    Args { verbose, use_cache }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = parse_args();
     set_up_logger(module_path!(), args.verbose)?;
-    debug!("{:?}", args);
+    debug!("{args:?}");
+
+    let alerts = mbtalerts::alerts(args.use_cache).await?;
+    debug!("{alerts:?}");
 
     Ok(())
 }

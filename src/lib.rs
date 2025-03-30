@@ -1,6 +1,20 @@
+use again::RetryPolicy;
 use anyhow::Result;
-use log::LevelFilter;
+use chrono::Utc;
+use log::{LevelFilter, debug, trace};
+use mbta_client::models::Alerts;
+use reqwest::{Client, Method};
+use serde::Serialize;
 use std::borrow::Cow;
+use std::env;
+use std::fmt::format;
+use std::path::Path;
+use std::time::Duration;
+use tokio::fs;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+
+const MBTA_API_URL: &'static str = "https://api-v3.mbta.com";
 
 pub fn set_up_logger<T>(calling_module: T, verbose: bool) -> Result<()>
 where
@@ -27,6 +41,91 @@ where
         .level_for(calling_module, level)
         .chain(std::io::stdout())
         .apply();
+
+    Ok(())
+}
+
+pub async fn alerts(use_cache: bool) -> Result<Alerts> {
+    let mut cache_path = env::temp_dir();
+    cache_path.push(format!(
+        "alerts.{}.json",
+        Utc::now().date_naive().format("%Y%m%d")
+    ));
+
+    let response = try_cached_query(use_cache, &cache_path, query_alerts).await?;
+
+    let alerts: Alerts = serde_json::from_str(&response)?;
+
+    Ok(alerts)
+}
+
+async fn http_get(url: &str) -> Result<String> {
+    let retry_policy = RetryPolicy::exponential(Duration::from_millis(100))
+        .with_jitter(true)
+        .with_max_delay(Duration::from_secs(1))
+        .with_max_retries(3);
+
+    let response = retry_policy
+        .retry(|| {
+            Client::new()
+                .request(Method::GET, url)
+                .header("Accept", "application/json")
+                .header("Accept-Encoding", "gzip")
+                .send()
+        })
+        .await?
+        .text()
+        .await?;
+
+    trace!("{}", response);
+
+    Ok(response)
+}
+
+async fn query_alerts() -> Result<String> {
+    http_get(&format!("{MBTA_API_URL}/alerts")).await
+}
+
+async fn try_cached_query<F>(
+    use_cache: bool,
+    cache_path: &Path,
+    query: impl Fn() -> F,
+) -> Result<String>
+where
+    F: Future<Output = Result<String>>,
+{
+    match try_cached(use_cache, cache_path).await? {
+        Some(cached) => Ok(cached),
+        _ => {
+            let response = query().await?;
+            try_write_cache(use_cache, cache_path, &response).await?;
+            Ok(response)
+        }
+    }
+}
+
+async fn try_cached(use_cache: bool, cache_path: &Path) -> Result<Option<String>> {
+    if use_cache && cache_path.exists() {
+        debug!("Reading cache file: {:?}", cache_path);
+        Ok(Some(fs::read_to_string(cache_path).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn try_write_cache(use_cache: bool, cache_path: &Path, response: &str) -> Result<()> {
+    if use_cache {
+        debug!("Writing response to cache file: {:?}", cache_path);
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(cache_path)
+            .await?;
+
+        file.write_all(response.as_bytes()).await?;
+    }
 
     Ok(())
 }

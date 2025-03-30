@@ -8,6 +8,7 @@ edition = "2024"
 name = "mbtalerts"
 
 [dependencies]
+again = "0.1"
 anyhow = "1.0"
 chrono = "0.4"
 clap = { version = "4.5", features = ["env"] }
@@ -15,5 +16,7 @@ fern = "0.7"
 lambda_runtime = "0.13"
 log = "0.4"
 mbta_client = { path = "src/mbta-client" }
+reqwest = { version = "0.12", features = ["gzip", "json"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.*"
 tokio = { version = "1.*", features = ["full"] }
