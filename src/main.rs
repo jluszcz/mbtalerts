@@ -41,8 +41,7 @@ async fn main() -> anyhow::Result<()> {
     set_up_logger(module_path!(), args.verbose)?;
     debug!("{args:?}");
 
-    let alerts = mbtalerts::alerts(args.use_cache).await?;
-    debug!("{alerts:?}");
+    let _alerts = mbtalerts::alerts(args.use_cache).await?;
 
     Ok(())
 }
