@@ -44,7 +44,7 @@ pub async fn alerts(use_cache: bool) -> Result<Alerts> {
     ));
 
     let response = try_cached_query(use_cache, &cache_path, query_subway_alerts).await?;
-    debug!("{response}");
+    trace!("{response}");
 
     let alerts: Alerts = serde_json::from_str(&response)?;
 

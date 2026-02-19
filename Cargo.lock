@@ -1669,6 +1669,7 @@ dependencies = [
  "lambda_runtime",
  "log",
  "reqwest",
+ "rustls 0.23.36",
  "serde",
  "serde_json",
  "tokio",
