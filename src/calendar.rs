@@ -169,10 +169,20 @@ pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
 
     for alert in &alerts.data {
         if let Some(event_id) = existing_by_alert_id.get(&alert.id) {
-            debug!("Updating event for alert {}", alert.id);
+            debug!(
+                "Updating event for alert {}: [{}] {}",
+                alert.id,
+                crate::line_name(alert),
+                alert.attributes.effect
+            );
             cal.update_event(event_id, alert).await?;
         } else {
-            debug!("Creating event for alert {}", alert.id);
+            debug!(
+                "Creating event for alert {}: [{}] {}",
+                alert.id,
+                crate::line_name(alert),
+                alert.attributes.effect
+            );
             cal.create_event(alert).await?;
         }
         seen.insert(alert.id.clone());
@@ -188,17 +198,38 @@ pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
     Ok(())
 }
 
-fn event_time(dt: Option<&str>) -> Value {
-    match dt {
-        Some(s) => json!({ "dateTime": s }),
-        None => json!({ "date": chrono::Utc::now().format("%Y-%m-%d").to_string() }),
+fn next_date(date: &str) -> String {
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|d| {
+            (d + chrono::Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|_| date.to_string())
+}
+
+fn event_times(start: Option<&str>, end: Option<&str>) -> (Value, Value) {
+    match (start, end) {
+        (Some(s), Some(e)) => (json!({ "dateTime": s }), json!({ "dateTime": e })),
+        (Some(s), None) => {
+            // Open-ended alert: all-day event on the start date (end is exclusive in Google Calendar)
+            let date = s.get(..10).unwrap_or(s);
+            (json!({ "date": date }), json!({ "date": next_date(date) }))
+        }
+        _ => {
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let tomorrow = next_date(&today);
+            (json!({ "date": today }), json!({ "date": tomorrow }))
+        }
     }
 }
 
 fn event_body(alert: &Alert) -> Value {
     let period = alert.attributes.active_period.first();
-    let start = event_time(period.and_then(|p| p.start.as_deref()));
-    let end = event_time(period.and_then(|p| p.end.as_deref()));
+    let (start, end) = event_times(
+        period.and_then(|p| p.start.as_deref()),
+        period.and_then(|p| p.end.as_deref()),
+    );
 
     json!({
         "summary": format!("[{}] {}", crate::line_name(alert), alert.attributes.effect),

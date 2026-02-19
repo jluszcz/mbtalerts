@@ -2,6 +2,7 @@ use chrono::DateTime;
 use clap::{Arg, ArgAction, Command};
 use jluszcz_rust_utils::{Verbosity, set_up_logger};
 use log::debug;
+use mbtalerts::calendar::{CalendarClient, sync_alerts};
 use mbtalerts::types::Alerts;
 use mbtalerts::{APP_NAME, line_name};
 
@@ -11,6 +12,7 @@ const SEPARATOR: &str = "----------------------------------------";
 struct Args {
     verbosity: Verbosity,
     use_cache: bool,
+    sync_calendar: bool,
 }
 
 fn parse_args() -> Args {
@@ -30,15 +32,24 @@ fn parse_args() -> Args {
                 .action(ArgAction::SetTrue)
                 .help("Query remote services instead of using cached values."),
         )
+        .arg(
+            Arg::new("sync-calendar")
+                .short('s')
+                .long("sync-calendar")
+                .action(ArgAction::SetTrue)
+                .help("Sync alerts to Google Calendar (requires GOOGLE_CALENDAR_ID and GOOGLE_SERVICE_ACCOUNT_KEY env vars)."),
+        )
         .get_matches();
 
     let verbosity = matches.get_count("verbosity").into();
 
     let use_cache = !matches.get_flag("no-cache");
+    let sync_calendar = matches.get_flag("sync-calendar");
 
     Args {
         verbosity,
         use_cache,
+        sync_calendar,
     }
 }
 
@@ -75,12 +86,20 @@ fn print_alerts(alerts: &Alerts) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let args = parse_args();
     set_up_logger(APP_NAME, module_path!(), args.verbosity)?;
     debug!("{args:?}");
 
     let alerts = mbtalerts::alerts(args.use_cache).await?;
-    print_alerts(&alerts);
+
+    if args.sync_calendar {
+        let calendar = CalendarClient::from_env().await?;
+        sync_alerts(&alerts, &calendar).await?;
+    } else {
+        print_alerts(&alerts);
+    }
 
     Ok(())
 }
