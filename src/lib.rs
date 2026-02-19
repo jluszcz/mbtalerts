@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::env;
 use std::path::Path;
 use std::time::Duration;
@@ -6,7 +5,7 @@ use std::time::Duration;
 use again::RetryPolicy;
 use anyhow::Result;
 use chrono::Utc;
-use log::{LevelFilter, debug, trace};
+use log::{debug, trace};
 use reqwest::{Client, Method};
 use serde::Serialize;
 use tokio::fs;
@@ -14,40 +13,27 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
 use crate::mbta::query_subway_alerts;
-use crate::types::Alerts;
+use crate::types::{Alert, Alerts};
 
 pub mod calendar;
 pub mod gtfs;
 pub mod mbta;
 pub mod types;
 
-pub fn set_up_logger<T>(calling_module: T, verbose: bool) -> Result<()>
-where
-    T: Into<Cow<'static, str>>,
-{
-    let level = if verbose {
-        LevelFilter::Debug
-    } else {
-        LevelFilter::Info
-    };
+pub const APP_NAME: &str = "mbtalerts";
 
-    let _ = fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{} [{}] [{}] {}",
-                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
-                record.target(),
-                record.level(),
-                message
-            ))
-        })
-        .level(LevelFilter::Warn)
-        .level_for("mbtalerts", level)
-        .level_for(calling_module, level)
-        .chain(std::io::stdout())
-        .apply();
-
-    Ok(())
+pub fn line_name(alert: &Alert) -> &str {
+    for entity in &alert.attributes.informed_entity {
+        if let Some(route) = &entity.route {
+            return match route.as_str() {
+                "Red" => "Red Line",
+                "Orange" => "Orange Line",
+                r if r.starts_with("Green") => "Green Line",
+                _ => "MBTA",
+            };
+        }
+    }
+    "MBTA"
 }
 
 pub async fn alerts(use_cache: bool) -> Result<Alerts> {

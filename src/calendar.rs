@@ -188,20 +188,6 @@ pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
     Ok(())
 }
 
-fn line_name(alert: &Alert) -> &str {
-    for entity in &alert.attributes.informed_entity {
-        if let Some(route) = &entity.route {
-            return match route.as_str() {
-                "Red" => "Red Line",
-                "Orange" => "Orange Line",
-                r if r.starts_with("Green") => "Green Line",
-                _ => "MBTA",
-            };
-        }
-    }
-    "MBTA"
-}
-
 fn event_time(dt: Option<&str>) -> Value {
     match dt {
         Some(s) => json!({ "dateTime": s }),
@@ -215,7 +201,7 @@ fn event_body(alert: &Alert) -> Value {
     let end = event_time(period.and_then(|p| p.end.as_deref()));
 
     json!({
-        "summary": format!("[{}] {}", line_name(alert), alert.attributes.effect),
+        "summary": format!("[{}] {}", crate::line_name(alert), alert.attributes.effect),
         "description": alert.attributes.description,
         "start": start,
         "end": end,

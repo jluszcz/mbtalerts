@@ -1,11 +1,12 @@
+use jluszcz_rust_utils::{Verbosity, set_up_logger};
 use lambda_runtime::{LambdaEvent, service_fn};
-use serde_json::{Value, json};
-
+use mbtalerts::APP_NAME;
 use mbtalerts::calendar::{CalendarClient, sync_alerts};
+use serde_json::{Value, json};
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
-    mbtalerts::set_up_logger("bootstrap", false).map_err(|e| e.to_string())?;
+    set_up_logger(APP_NAME, module_path!(), Verbosity::Debug)?;
     lambda_runtime::run(service_fn(handler)).await
 }
 
