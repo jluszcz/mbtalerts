@@ -1,16 +1,6 @@
-use std::env;
-use std::path::Path;
-use std::time::Duration;
-
-use again::RetryPolicy;
 use anyhow::Result;
-use chrono::Utc;
-use log::{debug, trace};
-use reqwest::{Client, Method};
-use serde::Serialize;
-use tokio::fs;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+use jluszcz_rust_utils::cache::{dated_cache_path, try_cached_query};
+use log::trace;
 
 use crate::mbta::query_subway_alerts;
 use crate::types::{Alert, Alerts};
@@ -37,11 +27,7 @@ pub fn line_name(alert: &Alert) -> &str {
 }
 
 pub async fn alerts(use_cache: bool) -> Result<Alerts> {
-    let mut cache_path = env::temp_dir();
-    cache_path.push(format!(
-        "alerts.{}.json",
-        Utc::now().date_naive().format("%Y%m%d")
-    ));
+    let cache_path = dated_cache_path("alerts");
 
     let response = try_cached_query(use_cache, &cache_path, query_subway_alerts).await?;
     trace!("{response}");
@@ -49,77 +35,6 @@ pub async fn alerts(use_cache: bool) -> Result<Alerts> {
     let alerts: Alerts = serde_json::from_str(&response)?;
 
     Ok(alerts)
-}
-
-async fn http_get<T>(url: &str, params: &T) -> Result<String>
-where
-    T: Serialize + ?Sized,
-{
-    let retry_policy = RetryPolicy::exponential(Duration::from_millis(100))
-        .with_jitter(true)
-        .with_max_delay(Duration::from_secs(1))
-        .with_max_retries(3);
-
-    let response = retry_policy
-        .retry(|| {
-            Client::new()
-                .request(Method::GET, url)
-                .header("Accept", "application/json")
-                .header("Accept-Encoding", "gzip")
-                .query(params)
-                .send()
-        })
-        .await?
-        .text()
-        .await?;
-
-    trace!("{}", response);
-
-    Ok(response)
-}
-
-async fn try_cached_query<F>(
-    use_cache: bool,
-    cache_path: &Path,
-    query: impl Fn() -> F,
-) -> Result<String>
-where
-    F: Future<Output = Result<String>>,
-{
-    match try_cached(use_cache, cache_path).await? {
-        Some(cached) => Ok(cached),
-        _ => {
-            let response = query().await?;
-            try_write_cache(use_cache, cache_path, &response).await?;
-            Ok(response)
-        }
-    }
-}
-
-async fn try_cached(use_cache: bool, cache_path: &Path) -> Result<Option<String>> {
-    if use_cache && cache_path.exists() {
-        debug!("Reading cache file: {:?}", cache_path);
-        Ok(Some(fs::read_to_string(cache_path).await?))
-    } else {
-        Ok(None)
-    }
-}
-
-async fn try_write_cache(use_cache: bool, cache_path: &Path, response: &str) -> Result<()> {
-    if use_cache {
-        debug!("Writing response to cache file: {:?}", cache_path);
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(cache_path)
-            .await?;
-
-        file.write_all(response.as_bytes()).await?;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

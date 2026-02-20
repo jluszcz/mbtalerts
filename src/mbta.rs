@@ -1,4 +1,4 @@
-use crate::http_get;
+use jluszcz_rust_utils::query::http_get;
 
 const API_URL: &str = "https://api-v3.mbta.com";
 const ALERTS: &str = "alerts";
