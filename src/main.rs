@@ -59,6 +59,24 @@ fn format_dt(s: &str) -> String {
         .unwrap_or_else(|_| s.to_owned())
 }
 
+fn format_alert(alert: &mbtalerts::types::Alert) -> String {
+    let line = line_name(alert);
+    let effect = &alert.attributes.effect;
+    let period = alert.attributes.active_period.first();
+    let start = period
+        .and_then(|p| p.start.as_deref())
+        .map(format_dt)
+        .unwrap_or_else(|| "—".to_owned());
+    let end = period
+        .and_then(|p| p.end.as_deref())
+        .map(format_dt)
+        .unwrap_or_else(|| "-".to_owned());
+    format!(
+        "{effect}  {line}  {start}  {end}\n{}",
+        alert.attributes.header
+    )
+}
+
 fn print_alerts(alerts: &Alerts) {
     if alerts.data.is_empty() {
         println!("No active alerts.");
@@ -66,21 +84,8 @@ fn print_alerts(alerts: &Alerts) {
     }
 
     for alert in &alerts.data {
-        let line = line_name(alert);
-        let effect = &alert.attributes.effect;
-        let period = alert.attributes.active_period.first();
-        let start = period
-            .and_then(|p| p.start.as_deref())
-            .map(format_dt)
-            .unwrap_or_else(|| "—".to_owned());
-        let end = period
-            .and_then(|p| p.end.as_deref())
-            .map(format_dt)
-            .unwrap_or_else(|| "-".to_owned());
-
         println!("{SEPARATOR}");
-        println!("{effect}  {line}  {start}  {end}");
-        println!("{}", alert.attributes.header);
+        println!("{}", format_alert(alert));
     }
 }
 
@@ -102,4 +107,115 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use mbtalerts::types::{ActivePeriod, Alert, AlertAttributes, InformedEntity};
+
+    fn make_alert(route: &str, effect: &str, start: Option<&str>, end: Option<&str>) -> Alert {
+        Alert {
+            id: "test-id".to_owned(),
+            attributes: AlertAttributes {
+                header: "Service disruption in effect".to_owned(),
+                description: None,
+                active_period: vec![ActivePeriod {
+                    start: start.map(str::to_owned),
+                    end: end.map(str::to_owned),
+                }],
+                effect: effect.to_owned(),
+                informed_entity: vec![InformedEntity {
+                    route: Some(route.to_owned()),
+                }],
+            },
+        }
+    }
+
+    // --- format_dt ---
+
+    #[test]
+    fn test_format_dt_am() {
+        assert_eq!(
+            format_dt("2024-01-15T10:30:00-05:00"),
+            "10:30 AM 01/15/2024"
+        );
+    }
+
+    #[test]
+    fn test_format_dt_pm() {
+        assert_eq!(format_dt("2024-01-15T14:45:00-05:00"), "2:45 PM 01/15/2024");
+    }
+
+    #[test]
+    fn test_format_dt_midnight() {
+        assert_eq!(
+            format_dt("2024-01-15T00:00:00-05:00"),
+            "12:00 AM 01/15/2024"
+        );
+    }
+
+    #[test]
+    fn test_format_dt_noon() {
+        assert_eq!(
+            format_dt("2024-01-15T12:00:00-05:00"),
+            "12:00 PM 01/15/2024"
+        );
+    }
+
+    #[test]
+    fn test_format_dt_invalid_passthrough() {
+        assert_eq!(format_dt("not-a-date"), "not-a-date");
+    }
+
+    // --- format_alert ---
+
+    #[test]
+    fn test_format_alert_with_both_times() {
+        let alert = make_alert(
+            "Red",
+            "DELAY",
+            Some("2024-06-01T09:00:00-04:00"),
+            Some("2024-06-01T23:00:00-04:00"),
+        );
+        let output = format_alert(&alert);
+        assert!(output.contains("DELAY"));
+        assert!(output.contains("Red Line"));
+        assert!(output.contains("9:00 AM 06/01/2024"));
+        assert!(output.contains("11:00 PM 06/01/2024"));
+        assert!(output.contains("Service disruption in effect"));
+    }
+
+    #[test]
+    fn test_format_alert_no_period_uses_dashes() {
+        let alert = Alert {
+            id: "test-id".to_owned(),
+            attributes: AlertAttributes {
+                header: "Some header".to_owned(),
+                description: None,
+                active_period: vec![],
+                effect: "SUSPENSION".to_owned(),
+                informed_entity: vec![InformedEntity {
+                    route: Some("Orange".to_owned()),
+                }],
+            },
+        };
+        let output = format_alert(&alert);
+        assert!(output.contains("SUSPENSION"));
+        assert!(output.contains("Orange Line"));
+        assert!(output.contains('—'));
+    }
+
+    #[test]
+    fn test_format_alert_green_line() {
+        let alert = make_alert(
+            "Green-D",
+            "DETOUR",
+            Some("2024-06-01T08:00:00-04:00"),
+            Some("2024-06-01T20:00:00-04:00"),
+        );
+        let output = format_alert(&alert);
+        assert!(output.contains("Green Line"));
+        assert!(output.contains("DETOUR"));
+    }
 }
