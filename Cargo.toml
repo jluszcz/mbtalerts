@@ -10,7 +10,7 @@ name = "mbtalerts"
 path = "src/main.rs"
 
 [[bin]]
-name = "bootstrap"
+name = "lambda"
 path = "src/lambda.rs"
 
 [dependencies]
