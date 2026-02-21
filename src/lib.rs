@@ -45,12 +45,12 @@ mod test {
     fn make_alert(route: &str) -> Alert {
         Alert {
             id: "test-id".to_owned(),
-            attributes: crate::types::AlertAttributes {
+            attributes: types::AlertAttributes {
                 header: "Test header".to_owned(),
                 description: None,
                 active_period: vec![],
                 effect: "DELAY".to_owned(),
-                informed_entity: vec![crate::types::InformedEntity {
+                informed_entity: vec![types::InformedEntity {
                     route: Some(route.to_owned()),
                 }],
             },
@@ -60,7 +60,7 @@ mod test {
     fn make_alert_no_entities() -> Alert {
         Alert {
             id: "test-id".to_owned(),
-            attributes: crate::types::AlertAttributes {
+            attributes: types::AlertAttributes {
                 header: "Test header".to_owned(),
                 description: None,
                 active_period: vec![],
@@ -73,12 +73,12 @@ mod test {
     fn make_alert_null_route() -> Alert {
         Alert {
             id: "test-id".to_owned(),
-            attributes: crate::types::AlertAttributes {
+            attributes: types::AlertAttributes {
                 header: "Test header".to_owned(),
                 description: None,
                 active_period: vec![],
                 effect: "DELAY".to_owned(),
-                informed_entity: vec![crate::types::InformedEntity { route: None }],
+                informed_entity: vec![types::InformedEntity { route: None }],
             },
         }
     }
