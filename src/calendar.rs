@@ -13,6 +13,26 @@ use crate::types::{Alert, Alerts};
 const CAL_API: &str = "https://www.googleapis.com/calendar/v3/calendars";
 const SCOPES: &[&str] = &["https://www.googleapis.com/auth/calendar"];
 
+struct SecretString(String);
+
+impl SecretString {
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 pub struct CalendarClient {
     token_provider: Arc<dyn TokenProvider>,
     calendar_id: String,
@@ -52,12 +72,11 @@ impl CalendarEvent {
 
 impl CalendarClient {
     pub async fn from_env() -> Result<Self> {
+        let key_json = std::env::var("GOOGLE_SERVICE_ACCOUNT_KEY")
+            .map(SecretString)
+            .context("GOOGLE_SERVICE_ACCOUNT_KEY env var not set")?;
         let token_provider: Arc<dyn TokenProvider> =
-            if let Ok(key_json) = std::env::var("GOOGLE_SERVICE_ACCOUNT_KEY") {
-                Arc::new(CustomServiceAccount::from_json(&key_json)?)
-            } else {
-                gcp_auth::provider().await?
-            };
+            Arc::new(CustomServiceAccount::from_json(key_json.expose())?);
 
         let calendar_id =
             std::env::var("GOOGLE_CALENDAR_ID").context("GOOGLE_CALENDAR_ID env var not set")?;
@@ -72,6 +91,11 @@ impl CalendarClient {
     async fn access_token(&self) -> Result<String> {
         let token = self.token_provider.token(SCOPES).await?;
         Ok(token.as_str().to_owned())
+    }
+
+    async fn send_authenticated(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let token = self.access_token().await?;
+        Ok(req.bearer_auth(&token).send().await?.error_for_status()?)
     }
 
     fn events_url(&self) -> String {
@@ -112,48 +136,29 @@ impl CalendarClient {
     }
 
     async fn create_event(&self, alert: &Alert) -> Result<()> {
-        let token = self.access_token().await?;
-        let body = event_body(alert);
-
-        self.client
-            .post(self.events_url())
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
-
+        self.send_authenticated(self.client.post(self.events_url()).json(&event_body(alert)))
+            .await?;
         Ok(())
     }
 
     async fn update_event(&self, event_id: &str, alert: &Alert) -> Result<()> {
-        let token = self.access_token().await?;
-        let body = event_body(alert);
-
-        self.client
-            .put(self.event_url(event_id))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?;
-
+        self.send_authenticated(
+            self.client
+                .put(self.event_url(event_id))
+                .json(&event_body(alert)),
+        )
+        .await?;
         Ok(())
     }
 
     async fn delete_event(&self, event_id: &str) -> Result<()> {
-        let token = self.access_token().await?;
-
-        self.client
-            .delete(self.event_url(event_id))
-            .bearer_auth(&token)
-            .send()
-            .await?
-            .error_for_status()?;
-
+        self.send_authenticated(self.client.delete(self.event_url(event_id)))
+            .await?;
         Ok(())
     }
 }
+
+const STATION_EFFECTS_TO_SKIP: &[&str] = &["STATION_ISSUE", "STOP_CLOSURE", "STATION_CLOSURE"];
 
 pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
     let existing = cal.list_alert_events().await?;
@@ -168,21 +173,19 @@ pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
     let mut seen: HashSet<String> = HashSet::new();
 
     for alert in &alerts.data {
-        if let Some(event_id) = existing_by_alert_id.get(&alert.id) {
+        if STATION_EFFECTS_TO_SKIP.contains(&alert.attributes.effect.as_str()) {
             debug!(
-                "Updating event for alert {}: [{}] {}",
-                alert.id,
-                crate::line_name(alert),
-                alert.attributes.effect
+                "Skipping station issue alert {}: {}",
+                alert.id, alert.attributes.effect
             );
+            continue;
+        }
+        let summary = event_summary(alert);
+        if let Some(event_id) = existing_by_alert_id.get(&alert.id) {
+            debug!("Updating event for alert {}: {}", alert.id, summary);
             cal.update_event(event_id, alert).await?;
         } else {
-            debug!(
-                "Creating event for alert {}: [{}] {}",
-                alert.id,
-                crate::line_name(alert),
-                alert.attributes.effect
-            );
+            debug!("Creating event for alert {}: {}", alert.id, summary);
             cal.create_event(alert).await?;
         }
         seen.insert(alert.id.clone());
@@ -224,6 +227,103 @@ fn event_times(start: Option<&str>, end: Option<&str>) -> (Value, Value) {
     }
 }
 
+fn strip_line_prefix(header: &str) -> &str {
+    if let Some(colon_idx) = header.find(": ") {
+        let prefix = &header[..colon_idx];
+        if prefix.contains("Line") && prefix.len() <= 35 {
+            return header[colon_idx + 2..].trim_start();
+        }
+    }
+    header.trim_start()
+}
+
+/// Truncate content at boilerplate rationale clauses and the first ", " after 30 chars.
+fn brief_content(content: &str) -> String {
+    let boilerplate_phrases = [" to allow", " in order to"];
+    let mut end = content.len();
+
+    for phrase in &boilerplate_phrases {
+        if let Some(idx) = content.find(phrase) {
+            end = end.min(idx);
+        }
+    }
+
+    // Truncate at first ", " after 30 chars
+    let scan_from = 30.min(end);
+    if let Some(rel_idx) = content[scan_from..end].find(", ") {
+        end = scan_from + rel_idx;
+    }
+
+    content[..end].trim_end_matches(['.', ',', ' ']).to_string()
+}
+
+const LOCATION_STOP_MARKERS: &[&str] = &[
+    ", ",
+    " will ",
+    " this ",
+    " that ",
+    " from ",
+    " to allow",
+    " in order",
+    " starting",
+    " during",
+];
+
+/// Extract a location phrase ("between A and B" or "from A through B") from stripped content.
+fn location_phrase(content: &str) -> Option<String> {
+    let fragment = if let Some(idx) = content.find(" between ") {
+        &content[idx + 1..] // "between A and B..."
+    } else if let Some(idx) = content.find(" from ") {
+        let candidate = &content[idx + 1..]; // "from A through B..."
+        if !candidate.contains(" through ") {
+            return None;
+        }
+        candidate
+    } else {
+        return None;
+    };
+
+    let end = LOCATION_STOP_MARKERS
+        .iter()
+        .filter_map(|m| fragment.find(m))
+        .min()
+        .unwrap_or(fragment.len());
+
+    let phrase = fragment[..end].trim_end_matches(['.', ',', ' ']);
+    if phrase.is_empty() {
+        None
+    } else {
+        Some(phrase.to_string())
+    }
+}
+
+fn effect_label(effect: &str) -> &str {
+    match effect {
+        "SHUTTLE" => "Shuttle",
+        "DELAY" => "Delay",
+        "SUSPENSION" => "Suspension",
+        "SERVICE_CHANGE" => "Service change",
+        "SCHEDULE_CHANGE" => "Schedule change",
+        "DETOUR" => "Detour",
+        other => other,
+    }
+}
+
+fn event_summary(alert: &Alert) -> String {
+    let line = crate::line_name(alert);
+    let content = strip_line_prefix(&alert.attributes.header);
+    if let Some(loc) = location_phrase(content) {
+        format!(
+            "[{}] {} {}",
+            line,
+            effect_label(&alert.attributes.effect),
+            loc
+        )
+    } else {
+        format!("[{}] {}", line, brief_content(content))
+    }
+}
+
 fn event_body(alert: &Alert) -> Value {
     let period = alert.attributes.active_period.first();
     let (start, end) = event_times(
@@ -232,7 +332,7 @@ fn event_body(alert: &Alert) -> Value {
     );
 
     json!({
-        "summary": format!("[{}] {}", crate::line_name(alert), alert.attributes.effect),
+        "summary": event_summary(alert),
         "description": alert.attributes.description,
         "start": start,
         "end": end,
@@ -281,6 +381,10 @@ mod test {
                 }],
             },
         }
+    }
+
+    fn brief_header(header: &str) -> String {
+        brief_content(strip_line_prefix(header))
     }
 
     // --- next_date ---
@@ -347,10 +451,69 @@ mod test {
         assert_eq!(next_date(start_date), end_date);
     }
 
+    // --- brief_header ---
+
+    #[test]
+    fn test_brief_header_strips_red_line_prefix() {
+        assert_eq!(
+            brief_header(
+                "Red Line: Shuttle buses replace service from JFK/UMass through Ashmont (and Mattapan), April 1 - 9, to allow for critical track work."
+            ),
+            "Shuttle buses replace service from JFK/UMass through Ashmont (and Mattapan)"
+        );
+    }
+
+    #[test]
+    fn test_brief_header_strips_branch_prefix() {
+        assert_eq!(
+            brief_header(
+                "Green Line B Branch: Service will originate / terminate at the Lake Street platform, just outside of Boston College Station, from 8:45 PM on Friday."
+            ),
+            "Service will originate / terminate at the Lake Street platform"
+        );
+    }
+
+    #[test]
+    fn test_brief_header_truncates_at_to_allow() {
+        assert_eq!(
+            brief_header(
+                "Red Line Ashmont Branch: Service between JFK/UMass and Ashmont will operate with two shuttle trains from April 10 - 30 to allow for critical track work."
+            ),
+            "Service between JFK/UMass and Ashmont will operate with two shuttle trains from April 10 - 30"
+        );
+    }
+
+    #[test]
+    fn test_brief_header_truncates_at_comma_after_location() {
+        assert_eq!(
+            brief_header(
+                "Red Line: Shuttle buses will replace service between JFK/UMass and Braintree, the weekend of Mar 29 - 30, for signal upgrades."
+            ),
+            "Shuttle buses will replace service between JFK/UMass and Braintree"
+        );
+    }
+
+    #[test]
+    fn test_brief_header_no_prefix_no_truncation() {
+        assert_eq!(
+            brief_header("Delays expected on the Orange Line due to an earlier incident."),
+            "Delays expected on the Orange Line due to an earlier incident"
+        );
+    }
+
+    #[test]
+    fn test_brief_header_attention_passengers_prefix_not_stripped() {
+        // "Attention Passengers" doesn't contain "Line", so it should not be stripped
+        assert_eq!(
+            brief_header("Attention Passengers: Some service change is in effect."),
+            "Attention Passengers: Some service change is in effect"
+        );
+    }
+
     // --- event_body ---
 
     #[test]
-    fn test_event_body_summary_includes_line_and_effect() {
+    fn test_event_body_summary_uses_header() {
         let alert = make_alert(
             "Red",
             "DELAY",
@@ -358,7 +521,7 @@ mod test {
             Some("2024-06-01T23:00:00-04:00"),
         );
         let body = event_body(&alert);
-        assert_eq!(body["summary"], "[Red Line] DELAY");
+        assert_eq!(body["summary"], "[Red Line] Test header");
     }
 
     #[test]
@@ -370,7 +533,151 @@ mod test {
             None,
         );
         let body = event_body(&alert);
-        assert_eq!(body["summary"], "[Green Line] SUSPENSION");
+        assert_eq!(body["summary"], "[Green Line] Test header");
+    }
+
+    #[test]
+    fn test_event_body_summary_shuttle_with_location() {
+        let mut alert = make_alert(
+            "Red",
+            "SHUTTLE",
+            Some("2024-06-01T09:00:00-04:00"),
+            Some("2024-06-01T23:00:00-04:00"),
+        );
+        alert.attributes.header = "Red Line: Shuttle buses will replace service between Broadway and Ashmont this weekend.".to_owned();
+        let body = event_body(&alert);
+        assert_eq!(
+            body["summary"],
+            "[Red Line] Shuttle between Broadway and Ashmont"
+        );
+    }
+
+    #[test]
+    fn test_event_body_summary_service_change_between() {
+        let mut alert = make_alert(
+            "Red",
+            "SERVICE_CHANGE",
+            Some("2024-06-01T09:00:00-04:00"),
+            Some("2024-06-01T23:00:00-04:00"),
+        );
+        alert.attributes.header = "Red Line Ashmont Branch: Service between JFK/UMass and Ashmont will operate with two shuttle trains from April 10 - 30 to allow for critical track work.".to_owned();
+        let body = event_body(&alert);
+        assert_eq!(
+            body["summary"],
+            "[Red Line] Service change between JFK/UMass and Ashmont"
+        );
+    }
+
+    // --- location_phrase ---
+
+    #[test]
+    fn test_location_phrase_between_truncates_at_this() {
+        assert_eq!(
+            location_phrase(
+                "Shuttle buses will replace service between Broadway and Ashmont this weekend."
+            ),
+            Some("between Broadway and Ashmont".to_string())
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_between_truncates_at_comma() {
+        assert_eq!(
+            location_phrase(
+                "Shuttle buses will replace service between JFK/UMass and Braintree, the weekend of Mar 29 - 30."
+            ),
+            Some("between JFK/UMass and Braintree".to_string())
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_between_truncates_at_will() {
+        assert_eq!(
+            location_phrase(
+                "Service between JFK/UMass and Ashmont will operate with two shuttle trains."
+            ),
+            Some("between JFK/UMass and Ashmont".to_string())
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_from_through() {
+        assert_eq!(
+            location_phrase(
+                "Shuttle buses replace service from JFK/UMass through Ashmont (and Mattapan), April 1 - 9."
+            ),
+            Some("from JFK/UMass through Ashmont (and Mattapan)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_between_truncates_at_from_date() {
+        assert_eq!(
+            location_phrase(
+                "Shuttle buses replace service between Back Bay and Forest Hills from February 28 - March 8 to allow for track work."
+            ),
+            Some("between Back Bay and Forest Hills".to_string())
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_from_to_without_through_returns_none() {
+        assert_eq!(
+            location_phrase("Shuttle buses replace service from North Station to Anderson/Woburn."),
+            None
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_none_when_no_pattern() {
+        assert_eq!(
+            location_phrase("Service will originate / terminate at the Lake Street platform."),
+            None
+        );
+    }
+
+    // --- effect_label ---
+
+    #[test]
+    fn test_effect_label_shuttle() {
+        assert_eq!(effect_label("SHUTTLE"), "Shuttle");
+    }
+
+    #[test]
+    fn test_effect_label_service_change() {
+        assert_eq!(effect_label("SERVICE_CHANGE"), "Service change");
+    }
+
+    #[test]
+    fn test_effect_label_delay() {
+        assert_eq!(effect_label("DELAY"), "Delay");
+    }
+
+    #[test]
+    fn test_effect_label_unknown_passthrough() {
+        assert_eq!(effect_label("SOME_NEW_EFFECT"), "SOME_NEW_EFFECT");
+    }
+
+    // --- STATION_EFFECTS_TO_SKIP ---
+
+    #[test]
+    fn test_station_issue_is_skipped() {
+        assert!(STATION_EFFECTS_TO_SKIP.contains(&"STATION_ISSUE"));
+    }
+
+    #[test]
+    fn test_stop_closure_is_skipped() {
+        assert!(STATION_EFFECTS_TO_SKIP.contains(&"STOP_CLOSURE"));
+    }
+
+    #[test]
+    fn test_station_closure_is_skipped() {
+        assert!(STATION_EFFECTS_TO_SKIP.contains(&"STATION_CLOSURE"));
+    }
+
+    #[test]
+    fn test_shuttle_is_not_skipped() {
+        assert!(!STATION_EFFECTS_TO_SKIP.contains(&"SHUTTLE"));
     }
 
     #[test]
