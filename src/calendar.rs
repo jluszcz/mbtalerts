@@ -110,13 +110,17 @@ impl CalendarClient {
         let token = self.access_token().await?;
         let mut events = Vec::new();
         let mut page_token: Option<String> = None;
+        let time_min = chrono::Utc::now().to_rfc3339();
 
         loop {
             let mut req = self
                 .client
                 .get(self.events_url())
                 .bearer_auth(&token)
-                .query(&[("privateExtendedProperty", "mbta_alert_source=true")]);
+                .query(&[
+                    ("privateExtendedProperty", "mbta_alert_source=true"),
+                    ("timeMin", &time_min),
+                ]);
 
             if let Some(pt) = &page_token {
                 req = req.query(&[("pageToken", pt.as_str())]);
@@ -336,6 +340,7 @@ fn event_body(alert: &Alert) -> Value {
         "description": alert.attributes.description,
         "start": start,
         "end": end,
+        "transparency": "transparent",
         "extendedProperties": {
             "private": {
                 "mbta_alert_source": "true",
