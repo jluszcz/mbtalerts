@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     lambda::init(APP_NAME, module_path!(), false).await?;
     let func = service_fn(handler);
     lambda_runtime::run(func).await?;
