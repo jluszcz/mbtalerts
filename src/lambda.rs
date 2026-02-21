@@ -1,4 +1,4 @@
-use jluszcz_rust_utils::{Verbosity, set_up_logger, lambda};
+use jluszcz_rust_utils::lambda;
 use lambda_runtime::{LambdaEvent, service_fn};
 use mbtalerts::APP_NAME;
 use mbtalerts::calendar::{CalendarClient, sync_alerts};
