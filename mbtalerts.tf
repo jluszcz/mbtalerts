@@ -94,7 +94,7 @@ resource "aws_lambda_function" "mbtalerts" {
   handler       = "ignored"
   publish       = "false"
   description   = "Sync MBTA Alerts against Google Calendars"
-  timeout       = 5
+  timeout       = 30
   memory_size   = 128
 
   environment {
