@@ -7,8 +7,6 @@ terraform {
 }
 
 # Sourced from environment variables named TF_VAR_${VAR_NAME}
-variable "aws_acct_id" {}
-
 variable "aws_region" {}
 
 variable "code_bucket" {}
@@ -57,23 +55,6 @@ data "aws_iam_policy_document" "assume_role" {
 resource "aws_iam_role" "role" {
   name               = "mbtalerts.lambda"
   assume_role_policy = data.aws_iam_policy_document.assume_role.json
-}
-
-data "aws_iam_policy_document" "logs" {
-  statement {
-    actions   = ["logs:Describe*", "logs:DeleteLogStream"]
-    resources = ["arn:aws:logs:${var.aws_region}:${var.aws_acct_id}:*"]
-  }
-}
-
-resource "aws_iam_policy" "logs" {
-  name   = "mbtalerts.logs"
-  policy = data.aws_iam_policy_document.logs.json
-}
-
-resource "aws_iam_role_policy_attachment" "logs" {
-  role       = aws_iam_role.role.name
-  policy_arn = aws_iam_policy.logs.arn
 }
 
 data "aws_iam_policy_document" "cw" {
