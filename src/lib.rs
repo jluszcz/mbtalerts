@@ -6,7 +6,6 @@ use crate::mbta::query_subway_alerts;
 use crate::types::{Alert, Alerts};
 
 pub mod calendar;
-pub mod gtfs;
 pub mod mbta;
 pub mod types;
 
