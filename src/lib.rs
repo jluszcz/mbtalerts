@@ -17,6 +17,7 @@ pub fn line_name(alert: &Alert) -> &str {
             return match route.as_str() {
                 "Red" => "Red Line",
                 "Orange" => "Orange Line",
+                "Blue" => "Blue Line",
                 r if r.starts_with("Green") => "Green Line",
                 _ => "MBTA",
             };
@@ -127,8 +128,13 @@ mod test {
     }
 
     #[test]
+    fn test_line_name_blue() {
+        assert_eq!(line_name(&make_alert("Blue")), "Blue Line");
+    }
+
+    #[test]
     fn test_line_name_unknown_route() {
-        assert_eq!(line_name(&make_alert("Blue")), "MBTA");
+        assert_eq!(line_name(&make_alert("CR-Fitchburg")), "MBTA");
     }
 
     #[test]

@@ -307,10 +307,43 @@ fn effect_label(effect: &str) -> &str {
     }
 }
 
+/// For DELAY effects, extract "~N minutes" from content like
+/// "Delays of about 20 minutes due to signal problem".
+fn delay_duration_phrase(content: &str) -> Option<String> {
+    let lower = content.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let min_pos = words.iter().position(|w| w.starts_with("minute"))?;
+    if min_pos == 0 {
+        return None;
+    }
+    // "N to M minutes" pattern
+    if min_pos >= 3
+        && words[min_pos - 2] == "to"
+        && words[min_pos - 1].chars().all(|c| c.is_ascii_digit())
+        && words[min_pos - 3].chars().all(|c| c.is_ascii_digit())
+    {
+        return Some(format!(
+            "~{}-{} minutes",
+            words[min_pos - 3],
+            words[min_pos - 1]
+        ));
+    }
+    // "N minutes" pattern
+    if words[min_pos - 1].chars().all(|c| c.is_ascii_digit()) {
+        return Some(format!("~{} minutes", words[min_pos - 1]));
+    }
+    None
+}
+
 fn event_summary(alert: &Alert) -> String {
     let line = crate::line_name(alert);
     let content = strip_line_prefix(&alert.attributes.header);
     let label = effect_label(&alert.attributes.effect);
+    if alert.attributes.effect == "DELAY"
+        && let Some(duration) = delay_duration_phrase(content)
+    {
+        return format!("[{}] Delays of {}", line, duration);
+    }
     if let Some(loc) = location_phrase(content) {
         format!("[{}] {} {}", line, label, loc)
     } else if let Some(cause) = cause_phrase(content) {
@@ -456,6 +489,32 @@ mod test {
         );
         let body = event_body(&alert);
         assert_eq!(body["summary"], "[Red Line] Delay");
+    }
+
+    #[test]
+    fn test_event_body_summary_delay_about_minutes() {
+        let mut alert = make_alert(
+            "Red",
+            "DELAY",
+            Some("2026-02-23T05:49:00-05:00"),
+            Some("2026-02-23T13:47:00-05:00"),
+        );
+        alert.attributes.header = "Red Line Braintree Branch: Delays of about 20 minutes due to a signal problem at Braintree.".to_owned();
+        let body = event_body(&alert);
+        assert_eq!(body["summary"], "[Red Line] Delays of ~20 minutes");
+    }
+
+    #[test]
+    fn test_event_body_summary_delay_up_to_minutes() {
+        let mut alert = make_alert(
+            "Blue",
+            "DELAY",
+            Some("2026-02-23T11:16:00-05:00"),
+            Some("2026-02-23T13:47:00-05:00"),
+        );
+        alert.attributes.header = "Blue Line: Delays of up to 20 minutes due to signal problem near Wonderland. Trains may stand by at stations.".to_owned();
+        let body = event_body(&alert);
+        assert_eq!(body["summary"], "[Blue Line] Delays of ~20 minutes");
     }
 
     #[test]
