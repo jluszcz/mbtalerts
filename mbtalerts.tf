@@ -23,10 +23,10 @@ data "aws_s3_bucket" "code_bucket" {
   bucket = var.code_bucket
 }
 
-// Run daily at 15:00 UTC
+// Run every 3 hours
 resource "aws_cloudwatch_event_rule" "schedule" {
   name                = "mbtalerts-schedule"
-  schedule_expression = "cron(0 15 * * ? *)"
+  schedule_expression = "rate(3 hours)"
 }
 
 resource "aws_cloudwatch_event_target" "schedule_target" {

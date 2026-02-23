@@ -241,26 +241,6 @@ fn strip_line_prefix(header: &str) -> &str {
     header.trim_start()
 }
 
-/// Truncate content at boilerplate rationale clauses and the first ", " after 30 chars.
-fn brief_content(content: &str) -> String {
-    let boilerplate_phrases = [" to allow", " in order to"];
-    let mut end = content.len();
-
-    for phrase in &boilerplate_phrases {
-        if let Some(idx) = content.find(phrase) {
-            end = end.min(idx);
-        }
-    }
-
-    // Truncate at first ", " after 30 chars
-    let scan_from = 30.min(end);
-    if let Some(rel_idx) = content[scan_from..end].find(", ") {
-        end = scan_from + rel_idx;
-    }
-
-    content[..end].trim_end_matches(['.', ',', ' ']).to_string()
-}
-
 const LOCATION_STOP_MARKERS: &[&str] = &[
     ", ",
     " will ",
@@ -301,6 +281,20 @@ fn location_phrase(content: &str) -> Option<String> {
     }
 }
 
+/// Extract a cause phrase ("due to X") from content, lowercased.
+fn cause_phrase(content: &str) -> Option<String> {
+    let lower = content.to_lowercase();
+    let idx = lower.find("due to")?;
+    let fragment = &lower[idx..];
+    let end = fragment.find([',', '.']).unwrap_or(fragment.len());
+    let phrase = fragment[..end].trim_end_matches(['.', ',', ' ']);
+    if phrase.is_empty() {
+        None
+    } else {
+        Some(phrase.to_string())
+    }
+}
+
 fn effect_label(effect: &str) -> &str {
     match effect {
         "SHUTTLE" => "Shuttle",
@@ -316,15 +310,13 @@ fn effect_label(effect: &str) -> &str {
 fn event_summary(alert: &Alert) -> String {
     let line = crate::line_name(alert);
     let content = strip_line_prefix(&alert.attributes.header);
+    let label = effect_label(&alert.attributes.effect);
     if let Some(loc) = location_phrase(content) {
-        format!(
-            "[{}] {} {}",
-            line,
-            effect_label(&alert.attributes.effect),
-            loc
-        )
+        format!("[{}] {} {}", line, label, loc)
+    } else if let Some(cause) = cause_phrase(content) {
+        format!("[{}] {} {}", line, label, cause)
     } else {
-        format!("[{}] {}", line, brief_content(content))
+        format!("[{}] {}", line, label)
     }
 }
 
@@ -386,10 +378,6 @@ mod test {
                 }],
             },
         }
-    }
-
-    fn brief_header(header: &str) -> String {
-        brief_content(strip_line_prefix(header))
     }
 
     // --- next_date ---
@@ -456,69 +444,10 @@ mod test {
         assert_eq!(next_date(start_date), end_date);
     }
 
-    // --- brief_header ---
-
-    #[test]
-    fn test_brief_header_strips_red_line_prefix() {
-        assert_eq!(
-            brief_header(
-                "Red Line: Shuttle buses replace service from JFK/UMass through Ashmont (and Mattapan), April 1 - 9, to allow for critical track work."
-            ),
-            "Shuttle buses replace service from JFK/UMass through Ashmont (and Mattapan)"
-        );
-    }
-
-    #[test]
-    fn test_brief_header_strips_branch_prefix() {
-        assert_eq!(
-            brief_header(
-                "Green Line B Branch: Service will originate / terminate at the Lake Street platform, just outside of Boston College Station, from 8:45 PM on Friday."
-            ),
-            "Service will originate / terminate at the Lake Street platform"
-        );
-    }
-
-    #[test]
-    fn test_brief_header_truncates_at_to_allow() {
-        assert_eq!(
-            brief_header(
-                "Red Line Ashmont Branch: Service between JFK/UMass and Ashmont will operate with two shuttle trains from April 10 - 30 to allow for critical track work."
-            ),
-            "Service between JFK/UMass and Ashmont will operate with two shuttle trains from April 10 - 30"
-        );
-    }
-
-    #[test]
-    fn test_brief_header_truncates_at_comma_after_location() {
-        assert_eq!(
-            brief_header(
-                "Red Line: Shuttle buses will replace service between JFK/UMass and Braintree, the weekend of Mar 29 - 30, for signal upgrades."
-            ),
-            "Shuttle buses will replace service between JFK/UMass and Braintree"
-        );
-    }
-
-    #[test]
-    fn test_brief_header_no_prefix_no_truncation() {
-        assert_eq!(
-            brief_header("Delays expected on the Orange Line due to an earlier incident."),
-            "Delays expected on the Orange Line due to an earlier incident"
-        );
-    }
-
-    #[test]
-    fn test_brief_header_attention_passengers_prefix_not_stripped() {
-        // "Attention Passengers" doesn't contain "Line", so it should not be stripped
-        assert_eq!(
-            brief_header("Attention Passengers: Some service change is in effect."),
-            "Attention Passengers: Some service change is in effect"
-        );
-    }
-
     // --- event_body ---
 
     #[test]
-    fn test_event_body_summary_uses_header() {
+    fn test_event_body_summary_delay_no_cause() {
         let alert = make_alert(
             "Red",
             "DELAY",
@@ -526,11 +455,11 @@ mod test {
             Some("2024-06-01T23:00:00-04:00"),
         );
         let body = event_body(&alert);
-        assert_eq!(body["summary"], "[Red Line] Test header");
+        assert_eq!(body["summary"], "[Red Line] Delay");
     }
 
     #[test]
-    fn test_event_body_summary_green_line() {
+    fn test_event_body_summary_green_line_no_cause() {
         let alert = make_alert(
             "Green-B",
             "SUSPENSION",
@@ -538,7 +467,23 @@ mod test {
             None,
         );
         let body = event_body(&alert);
-        assert_eq!(body["summary"], "[Green Line] Test header");
+        assert_eq!(body["summary"], "[Green Line] Suspension");
+    }
+
+    #[test]
+    fn test_event_body_summary_service_change_with_cause() {
+        let mut alert = make_alert(
+            "MBTA",
+            "SERVICE_CHANGE",
+            Some("2026-02-23T03:00:00-05:00"),
+            Some("2026-02-24T02:59:00-05:00"),
+        );
+        alert.attributes.header = "Due to severe weather, Subway, Bus, and Commuter Rail are operating on a reduced schedule. Ferry service is canceled.".to_owned();
+        let body = event_body(&alert);
+        assert_eq!(
+            body["summary"],
+            "[MBTA] Service change due to severe weather"
+        );
     }
 
     #[test]
@@ -639,6 +584,31 @@ mod test {
             location_phrase("Service will originate / terminate at the Lake Street platform."),
             None
         );
+    }
+
+    // --- cause_phrase ---
+
+    #[test]
+    fn test_cause_phrase_due_to_at_start() {
+        assert_eq!(
+            cause_phrase(
+                "Due to severe weather, Subway, Bus, and Commuter Rail are operating on a reduced schedule."
+            ),
+            Some("due to severe weather".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cause_phrase_due_to_midsentence() {
+        assert_eq!(
+            cause_phrase("Delays expected on the Orange Line due to an earlier incident."),
+            Some("due to an earlier incident".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cause_phrase_none_when_absent() {
+        assert_eq!(cause_phrase("Test header"), None);
     }
 
     // --- effect_label ---
