@@ -112,6 +112,7 @@ impl CalendarClient {
         let mut page_token: Option<String> = None;
         let time_min = chrono::Utc::now().to_rfc3339();
 
+        debug!("Listing calendar events");
         loop {
             let mut req = self
                 .client
@@ -127,7 +128,6 @@ impl CalendarClient {
             }
 
             let response: EventList = req.send().await?.error_for_status()?.json().await?;
-            debug!("Fetched {} calendar events", response.items.len());
             events.extend(response.items);
 
             match response.next_page_token {
@@ -135,29 +135,36 @@ impl CalendarClient {
                 None => break,
             }
         }
+        info!("Listed {} calendar events", events.len());
 
         Ok(events)
     }
 
     async fn create_event(&self, alert: &Alert) -> Result<()> {
+        debug!("Creating calendar event for alert {}", alert.id);
         self.send_authenticated(self.client.post(self.events_url()).json(&event_body(alert)))
             .await?;
+        info!("Created calendar event for alert {}", alert.id);
         Ok(())
     }
 
     async fn update_event(&self, event_id: &str, alert: &Alert) -> Result<()> {
+        debug!("Updating calendar event {event_id} for alert {}", alert.id);
         self.send_authenticated(
             self.client
                 .put(self.event_url(event_id))
                 .json(&event_body(alert)),
         )
         .await?;
+        info!("Updated calendar event {event_id} for alert {}", alert.id);
         Ok(())
     }
 
     async fn delete_event(&self, event_id: &str) -> Result<()> {
+        debug!("Deleting calendar event {event_id}");
         self.send_authenticated(self.client.delete(self.event_url(event_id)))
             .await?;
+        info!("Deleted calendar event {event_id}");
         Ok(())
     }
 }

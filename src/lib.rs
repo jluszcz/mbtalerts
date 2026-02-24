@@ -1,6 +1,6 @@
 use anyhow::Result;
 use jluszcz_rust_utils::cache::{dated_cache_path, try_cached_query};
-use log::trace;
+use log::{trace, warn};
 
 use crate::mbta::query_subway_alerts;
 use crate::types::{Alert, Alerts};
@@ -19,7 +19,10 @@ pub fn line_name(alert: &Alert) -> &str {
                 "Orange" => "Orange Line",
                 "Blue" => "Blue Line",
                 r if r.starts_with("Green") => "Green Line",
-                _ => "MBTA",
+                r => {
+                    warn!("Unknown route '{r}', falling back to MBTA");
+                    "MBTA"
+                }
             };
         }
     }
