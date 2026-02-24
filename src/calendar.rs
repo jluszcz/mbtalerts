@@ -112,6 +112,7 @@ impl CalendarClient {
         let mut page_token: Option<String> = None;
         let time_min = chrono::Utc::now().to_rfc3339();
 
+        debug!("Listing calendar events");
         loop {
             let mut req = self
                 .client
@@ -127,7 +128,6 @@ impl CalendarClient {
             }
 
             let response: EventList = req.send().await?.error_for_status()?.json().await?;
-            debug!("Fetched {} calendar events", response.items.len());
             events.extend(response.items);
 
             match response.next_page_token {
@@ -135,34 +135,46 @@ impl CalendarClient {
                 None => break,
             }
         }
+        info!("Listed {} calendar events", events.len());
 
         Ok(events)
     }
 
     async fn create_event(&self, alert: &Alert) -> Result<()> {
+        debug!("Creating calendar event for alert {}", alert.id);
         self.send_authenticated(self.client.post(self.events_url()).json(&event_body(alert)))
             .await?;
+        info!("Created calendar event for alert {}", alert.id);
         Ok(())
     }
 
     async fn update_event(&self, event_id: &str, alert: &Alert) -> Result<()> {
+        debug!("Updating calendar event {event_id} for alert {}", alert.id);
         self.send_authenticated(
             self.client
                 .put(self.event_url(event_id))
                 .json(&event_body(alert)),
         )
         .await?;
+        info!("Updated calendar event {event_id} for alert {}", alert.id);
         Ok(())
     }
 
     async fn delete_event(&self, event_id: &str) -> Result<()> {
+        debug!("Deleting calendar event {event_id}");
         self.send_authenticated(self.client.delete(self.event_url(event_id)))
             .await?;
+        info!("Deleted calendar event {event_id}");
         Ok(())
     }
 }
 
-const STATION_EFFECTS_TO_SKIP: &[&str] = &["STATION_ISSUE", "STOP_CLOSURE", "STATION_CLOSURE"];
+const STATION_EFFECTS_TO_SKIP: &[&str] = &[
+    "STATION_ISSUE",
+    "STOP_CLOSURE",
+    "STATION_CLOSURE",
+    "PARKING_ISSUE",
+];
 
 pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
     let existing = cal.list_alert_events().await?;
@@ -241,60 +253,6 @@ fn strip_line_prefix(header: &str) -> &str {
     header.trim_start()
 }
 
-const LOCATION_STOP_MARKERS: &[&str] = &[
-    ", ",
-    " will ",
-    " this ",
-    " that ",
-    " from ",
-    " to allow",
-    " in order",
-    " starting",
-    " during",
-];
-
-/// Extract a location phrase ("between A and B" or "from A through B") from stripped content.
-fn location_phrase(content: &str) -> Option<String> {
-    let fragment = if let Some(idx) = content.find(" between ") {
-        &content[idx + 1..] // "between A and B..."
-    } else if let Some(idx) = content.find(" from ") {
-        let candidate = &content[idx + 1..]; // "from A through B..."
-        if !candidate.contains(" through ") {
-            return None;
-        }
-        candidate
-    } else {
-        return None;
-    };
-
-    let end = LOCATION_STOP_MARKERS
-        .iter()
-        .filter_map(|m| fragment.find(m))
-        .min()
-        .unwrap_or(fragment.len());
-
-    let phrase = fragment[..end].trim_end_matches(['.', ',', ' ']);
-    if phrase.is_empty() {
-        None
-    } else {
-        Some(phrase.to_string())
-    }
-}
-
-/// Extract a cause phrase ("due to X") from content, lowercased.
-fn cause_phrase(content: &str) -> Option<String> {
-    let lower = content.to_lowercase();
-    let idx = lower.find("due to")?;
-    let fragment = &lower[idx..];
-    let end = fragment.find([',', '.']).unwrap_or(fragment.len());
-    let phrase = fragment[..end].trim_end_matches(['.', ',', ' ']);
-    if phrase.is_empty() {
-        None
-    } else {
-        Some(phrase.to_string())
-    }
-}
-
 fn effect_label(effect: &str) -> &str {
     match effect {
         "SHUTTLE" => "Shuttle",
@@ -337,20 +295,29 @@ fn delay_duration_phrase(content: &str) -> Option<String> {
 
 fn event_summary(alert: &Alert) -> String {
     let line = crate::line_name(alert);
-    let content = strip_line_prefix(&alert.attributes.header);
     let label = effect_label(&alert.attributes.effect);
-    if alert.attributes.effect == "DELAY"
-        && let Some(duration) = delay_duration_phrase(content)
-    {
-        return format!("[{}] Delays of {}", line, duration);
+    if alert.attributes.effect == "DELAY" {
+        let content = strip_line_prefix(&alert.attributes.header);
+        if let Some(duration) = delay_duration_phrase(content) {
+            return format!("[{}] Delay {}", line, duration);
+        }
     }
-    if let Some(loc) = location_phrase(content) {
-        format!("[{}] {} {}", line, label, loc)
-    } else if let Some(cause) = cause_phrase(content) {
-        format!("[{}] {} {}", line, label, cause)
-    } else {
-        format!("[{}] {}", line, label)
+    format!("[{}] {}", line, label)
+}
+
+/// Builds the calendar event description from available alert fields.
+///
+/// Always includes the alert header. Appends the full description and URL
+/// on separate sections when present.
+fn event_description(alert: &Alert) -> String {
+    let mut parts = vec![alert.attributes.header.trim().to_owned()];
+    if let Some(desc) = &alert.attributes.description {
+        parts.push(desc.trim().to_owned());
     }
+    if let Some(url) = &alert.attributes.url {
+        parts.push(url.clone());
+    }
+    parts.join("\n\n")
 }
 
 fn event_body(alert: &Alert) -> Value {
@@ -362,7 +329,7 @@ fn event_body(alert: &Alert) -> Value {
 
     json!({
         "summary": event_summary(alert),
-        "description": alert.attributes.description,
+        "description": event_description(alert),
         "start": start,
         "end": end,
         "transparency": "transparent",
@@ -386,6 +353,7 @@ mod test {
             attributes: AlertAttributes {
                 header: "Test header".to_owned(),
                 description: Some("Test description".to_owned()),
+                url: None,
                 active_period: vec![ActivePeriod {
                     start: start.map(str::to_owned),
                     end: end.map(str::to_owned),
@@ -404,6 +372,7 @@ mod test {
             attributes: AlertAttributes {
                 header: "Test header".to_owned(),
                 description: None,
+                url: None,
                 active_period: vec![],
                 effect: effect.to_owned(),
                 informed_entity: vec![InformedEntity {
@@ -501,7 +470,7 @@ mod test {
         );
         alert.attributes.header = "Red Line Braintree Branch: Delays of about 20 minutes due to a signal problem at Braintree.".to_owned();
         let body = event_body(&alert);
-        assert_eq!(body["summary"], "[Red Line] Delays of ~20 minutes");
+        assert_eq!(body["summary"], "[Red Line] Delay ~20 minutes");
     }
 
     #[test]
@@ -514,7 +483,7 @@ mod test {
         );
         alert.attributes.header = "Blue Line: Delays of up to 20 minutes due to signal problem near Wonderland. Trains may stand by at stations.".to_owned();
         let body = event_body(&alert);
-        assert_eq!(body["summary"], "[Blue Line] Delays of ~20 minutes");
+        assert_eq!(body["summary"], "[Blue Line] Delay ~20 minutes");
     }
 
     #[test]
@@ -539,10 +508,7 @@ mod test {
         );
         alert.attributes.header = "Due to severe weather, Subway, Bus, and Commuter Rail are operating on a reduced schedule. Ferry service is canceled.".to_owned();
         let body = event_body(&alert);
-        assert_eq!(
-            body["summary"],
-            "[MBTA] Service change due to severe weather"
-        );
+        assert_eq!(body["summary"], "[MBTA] Service change");
     }
 
     #[test]
@@ -555,10 +521,7 @@ mod test {
         );
         alert.attributes.header = "Red Line: Shuttle buses will replace service between Broadway and Ashmont this weekend.".to_owned();
         let body = event_body(&alert);
-        assert_eq!(
-            body["summary"],
-            "[Red Line] Shuttle between Broadway and Ashmont"
-        );
+        assert_eq!(body["summary"], "[Red Line] Shuttle");
     }
 
     #[test]
@@ -571,103 +534,55 @@ mod test {
         );
         alert.attributes.header = "Red Line Ashmont Branch: Service between JFK/UMass and Ashmont will operate with two shuttle trains from April 10 - 30 to allow for critical track work.".to_owned();
         let body = event_body(&alert);
-        assert_eq!(
-            body["summary"],
-            "[Red Line] Service change between JFK/UMass and Ashmont"
-        );
+        assert_eq!(body["summary"], "[Red Line] Service change");
     }
 
-    // --- location_phrase ---
+    // --- event_description ---
 
     #[test]
-    fn test_location_phrase_between_truncates_at_this() {
-        assert_eq!(
-            location_phrase(
-                "Shuttle buses will replace service between Broadway and Ashmont this weekend."
-            ),
-            Some("between Broadway and Ashmont".to_string())
-        );
+    fn test_event_description_header_only() {
+        let mut alert = make_alert("Red", "DELAY", None, None);
+        alert.attributes.description = None;
+        assert_eq!(event_description(&alert), "Test header");
     }
 
     #[test]
-    fn test_location_phrase_between_truncates_at_comma() {
-        assert_eq!(
-            location_phrase(
-                "Shuttle buses will replace service between JFK/UMass and Braintree, the weekend of Mar 29 - 30."
-            ),
-            Some("between JFK/UMass and Braintree".to_string())
-        );
+    fn test_event_description_header_and_description() {
+        let alert = make_alert("Red", "DELAY", None, None);
+        // make_alert sets description = Some("Test description")
+        assert_eq!(event_description(&alert), "Test header\n\nTest description");
     }
 
     #[test]
-    fn test_location_phrase_between_truncates_at_will() {
+    fn test_event_description_header_and_url() {
+        let mut alert = make_alert("Red", "DELAY", None, None);
+        alert.attributes.description = None;
+        alert.attributes.url = Some("https://mbta.com/RedLine".to_owned());
         assert_eq!(
-            location_phrase(
-                "Service between JFK/UMass and Ashmont will operate with two shuttle trains."
-            ),
-            Some("between JFK/UMass and Ashmont".to_string())
+            event_description(&alert),
+            "Test header\n\nhttps://mbta.com/RedLine"
         );
     }
 
     #[test]
-    fn test_location_phrase_from_through() {
+    fn test_event_description_all_fields() {
+        let mut alert = make_alert("Red", "SHUTTLE", None, None);
+        alert.attributes.url = Some("https://mbta.com/RedLine".to_owned());
         assert_eq!(
-            location_phrase(
-                "Shuttle buses replace service from JFK/UMass through Ashmont (and Mattapan), April 1 - 9."
-            ),
-            Some("from JFK/UMass through Ashmont (and Mattapan)".to_string())
+            event_description(&alert),
+            "Test header\n\nTest description\n\nhttps://mbta.com/RedLine"
         );
     }
 
     #[test]
-    fn test_location_phrase_between_truncates_at_from_date() {
+    fn test_event_description_trims_whitespace() {
+        let mut alert = make_alert("Red", "DELAY", None, None);
+        alert.attributes.header = "  Header with spaces  ".to_owned();
+        alert.attributes.description = Some("  Description with spaces  ".to_owned());
         assert_eq!(
-            location_phrase(
-                "Shuttle buses replace service between Back Bay and Forest Hills from February 28 - March 8 to allow for track work."
-            ),
-            Some("between Back Bay and Forest Hills".to_string())
+            event_description(&alert),
+            "Header with spaces\n\nDescription with spaces"
         );
-    }
-
-    #[test]
-    fn test_location_phrase_from_to_without_through_returns_none() {
-        assert_eq!(
-            location_phrase("Shuttle buses replace service from North Station to Anderson/Woburn."),
-            None
-        );
-    }
-
-    #[test]
-    fn test_location_phrase_none_when_no_pattern() {
-        assert_eq!(
-            location_phrase("Service will originate / terminate at the Lake Street platform."),
-            None
-        );
-    }
-
-    // --- cause_phrase ---
-
-    #[test]
-    fn test_cause_phrase_due_to_at_start() {
-        assert_eq!(
-            cause_phrase(
-                "Due to severe weather, Subway, Bus, and Commuter Rail are operating on a reduced schedule."
-            ),
-            Some("due to severe weather".to_string())
-        );
-    }
-
-    #[test]
-    fn test_cause_phrase_due_to_midsentence() {
-        assert_eq!(
-            cause_phrase("Delays expected on the Orange Line due to an earlier incident."),
-            Some("due to an earlier incident".to_string())
-        );
-    }
-
-    #[test]
-    fn test_cause_phrase_none_when_absent() {
-        assert_eq!(cause_phrase("Test header"), None);
     }
 
     // --- effect_label ---
@@ -710,6 +625,11 @@ mod test {
     }
 
     #[test]
+    fn test_parking_issue_is_skipped() {
+        assert!(STATION_EFFECTS_TO_SKIP.contains(&"PARKING_ISSUE"));
+    }
+
+    #[test]
     fn test_shuttle_is_not_skipped() {
         assert!(!STATION_EFFECTS_TO_SKIP.contains(&"SHUTTLE"));
     }
@@ -723,7 +643,7 @@ mod test {
             Some("2024-06-01T23:00:00-04:00"),
         );
         let body = event_body(&alert);
-        assert_eq!(body["description"], "Test description");
+        assert_eq!(body["description"], "Test header\n\nTest description");
     }
 
     #[test]

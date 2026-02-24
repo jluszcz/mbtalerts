@@ -15,6 +15,7 @@ pub struct Alert {
 pub struct AlertAttributes {
     pub header: String,
     pub description: Option<String>,
+    pub url: Option<String>,
     pub active_period: Vec<ActivePeriod>,
     pub effect: String,
     pub informed_entity: Vec<InformedEntity>,

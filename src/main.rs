@@ -120,6 +120,7 @@ mod test {
             attributes: AlertAttributes {
                 header: "Service disruption in effect".to_owned(),
                 description: None,
+                url: None,
                 active_period: vec![ActivePeriod {
                     start: start.map(str::to_owned),
                     end: end.map(str::to_owned),
@@ -193,6 +194,7 @@ mod test {
             attributes: AlertAttributes {
                 header: "Some header".to_owned(),
                 description: None,
+                url: None,
                 active_period: vec![],
                 effect: "SUSPENSION".to_owned(),
                 informed_entity: vec![InformedEntity {

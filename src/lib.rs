@@ -1,6 +1,6 @@
 use anyhow::Result;
 use jluszcz_rust_utils::cache::{dated_cache_path, try_cached_query};
-use log::trace;
+use log::{trace, warn};
 
 use crate::mbta::query_subway_alerts;
 use crate::types::{Alert, Alerts};
@@ -19,7 +19,10 @@ pub fn line_name(alert: &Alert) -> &str {
                 "Orange" => "Orange Line",
                 "Blue" => "Blue Line",
                 r if r.starts_with("Green") => "Green Line",
-                _ => "MBTA",
+                r => {
+                    warn!("Unknown route '{r}', falling back to MBTA");
+                    "MBTA"
+                }
             };
         }
     }
@@ -49,6 +52,7 @@ mod test {
             attributes: types::AlertAttributes {
                 header: "Test header".to_owned(),
                 description: None,
+                url: None,
                 active_period: vec![],
                 effect: "DELAY".to_owned(),
                 informed_entity: vec![types::InformedEntity {
@@ -64,6 +68,7 @@ mod test {
             attributes: types::AlertAttributes {
                 header: "Test header".to_owned(),
                 description: None,
+                url: None,
                 active_period: vec![],
                 effect: "DELAY".to_owned(),
                 informed_entity: vec![],
@@ -77,6 +82,7 @@ mod test {
             attributes: types::AlertAttributes {
                 header: "Test header".to_owned(),
                 description: None,
+                url: None,
                 active_period: vec![],
                 effect: "DELAY".to_owned(),
                 informed_entity: vec![types::InformedEntity { route: None }],
