@@ -337,10 +337,10 @@ fn event_summary(alert: &Alert) -> String {
     let line = crate::line_name(alert);
     let label = effect_label(&alert.attributes.effect);
     let content = strip_line_prefix(&alert.attributes.header);
-    if alert.attributes.effect == "DELAY" {
-        if let Some(duration) = delay_duration_phrase(content) {
-            return format!("[{}] Delay {}", line, duration);
-        }
+    if alert.attributes.effect == "DELAY"
+        && let Some(duration) = delay_duration_phrase(content)
+    {
+        return format!("[{}] Delay {}", line, duration);
     }
     if let Some(loc) = location_phrase(content) {
         format!("[{}] {} {}", line, label, loc)
