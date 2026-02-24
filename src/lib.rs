@@ -49,6 +49,7 @@ mod test {
             attributes: types::AlertAttributes {
                 header: "Test header".to_owned(),
                 description: None,
+                url: None,
                 active_period: vec![],
                 effect: "DELAY".to_owned(),
                 informed_entity: vec![types::InformedEntity {
@@ -64,6 +65,7 @@ mod test {
             attributes: types::AlertAttributes {
                 header: "Test header".to_owned(),
                 description: None,
+                url: None,
                 active_period: vec![],
                 effect: "DELAY".to_owned(),
                 informed_entity: vec![],
@@ -77,6 +79,7 @@ mod test {
             attributes: types::AlertAttributes {
                 header: "Test header".to_owned(),
                 description: None,
+                url: None,
                 active_period: vec![],
                 effect: "DELAY".to_owned(),
                 informed_entity: vec![types::InformedEntity { route: None }],
