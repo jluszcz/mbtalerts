@@ -305,6 +305,10 @@ fn event_summary(alert: &Alert) -> String {
     format!("[{}] {}", line, label)
 }
 
+/// Builds the calendar event description from available alert fields.
+///
+/// Always includes the alert header. Appends the full description and URL
+/// on separate sections when present.
 fn event_description(alert: &Alert) -> String {
     let mut parts = vec![alert.attributes.header.trim().to_owned()];
     if let Some(desc) = &alert.attributes.description {
