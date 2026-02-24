@@ -293,16 +293,60 @@ fn delay_duration_phrase(content: &str) -> Option<String> {
     None
 }
 
+const LOCATION_STOP_MARKERS: &[&str] = &[
+    ", ",
+    " will ",
+    " this ",
+    " that ",
+    " from ",
+    " to allow",
+    " in order",
+    " starting",
+    " during",
+];
+
+/// Extract a location phrase ("between A and B" or "from A through B") from stripped content.
+fn location_phrase(content: &str) -> Option<String> {
+    let fragment = if let Some(idx) = content.find(" between ") {
+        &content[idx + 1..]
+    } else if let Some(idx) = content.find(" from ") {
+        let candidate = &content[idx + 1..];
+        if !candidate.contains(" through ") {
+            return None;
+        }
+        candidate
+    } else {
+        return None;
+    };
+
+    let end = LOCATION_STOP_MARKERS
+        .iter()
+        .filter_map(|m| fragment.find(m))
+        .min()
+        .unwrap_or(fragment.len());
+
+    let phrase = fragment[..end].trim_end_matches(['.', ',', ' ']);
+    if phrase.is_empty() {
+        None
+    } else {
+        Some(phrase.to_string())
+    }
+}
+
 fn event_summary(alert: &Alert) -> String {
     let line = crate::line_name(alert);
     let label = effect_label(&alert.attributes.effect);
-    if alert.attributes.effect == "DELAY" {
-        let content = strip_line_prefix(&alert.attributes.header);
-        if let Some(duration) = delay_duration_phrase(content) {
-            return format!("[{}] Delay {}", line, duration);
-        }
+    let content = strip_line_prefix(&alert.attributes.header);
+    if alert.attributes.effect == "DELAY"
+        && let Some(duration) = delay_duration_phrase(content)
+    {
+        return format!("[{}] Delay {}", line, duration);
     }
-    format!("[{}] {}", line, label)
+    if let Some(loc) = location_phrase(content) {
+        format!("[{}] {} {}", line, label, loc)
+    } else {
+        format!("[{}] {}", line, label)
+    }
 }
 
 /// Builds the calendar event description from available alert fields.
@@ -521,7 +565,10 @@ mod test {
         );
         alert.attributes.header = "Red Line: Shuttle buses will replace service between Broadway and Ashmont this weekend.".to_owned();
         let body = event_body(&alert);
-        assert_eq!(body["summary"], "[Red Line] Shuttle");
+        assert_eq!(
+            body["summary"],
+            "[Red Line] Shuttle between Broadway and Ashmont"
+        );
     }
 
     #[test]
@@ -534,7 +581,78 @@ mod test {
         );
         alert.attributes.header = "Red Line Ashmont Branch: Service between JFK/UMass and Ashmont will operate with two shuttle trains from April 10 - 30 to allow for critical track work.".to_owned();
         let body = event_body(&alert);
-        assert_eq!(body["summary"], "[Red Line] Service change");
+        assert_eq!(
+            body["summary"],
+            "[Red Line] Service change between JFK/UMass and Ashmont"
+        );
+    }
+
+    // --- location_phrase ---
+
+    #[test]
+    fn test_location_phrase_between_truncates_at_this() {
+        assert_eq!(
+            location_phrase(
+                "Shuttle buses will replace service between Broadway and Ashmont this weekend."
+            ),
+            Some("between Broadway and Ashmont".to_string())
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_between_truncates_at_comma() {
+        assert_eq!(
+            location_phrase(
+                "Shuttle buses will replace service between JFK/UMass and Braintree, the weekend of Mar 29 - 30."
+            ),
+            Some("between JFK/UMass and Braintree".to_string())
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_between_truncates_at_will() {
+        assert_eq!(
+            location_phrase(
+                "Service between JFK/UMass and Ashmont will operate with two shuttle trains."
+            ),
+            Some("between JFK/UMass and Ashmont".to_string())
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_from_through() {
+        assert_eq!(
+            location_phrase(
+                "Shuttle buses replace service from JFK/UMass through Ashmont (and Mattapan), April 1 - 9."
+            ),
+            Some("from JFK/UMass through Ashmont (and Mattapan)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_between_truncates_at_from_date() {
+        assert_eq!(
+            location_phrase(
+                "Shuttle buses replace service between Back Bay and Forest Hills from February 28 - March 8 to allow for track work."
+            ),
+            Some("between Back Bay and Forest Hills".to_string())
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_from_to_without_through_returns_none() {
+        assert_eq!(
+            location_phrase("Shuttle buses replace service from North Station to Anderson/Woburn."),
+            None
+        );
+    }
+
+    #[test]
+    fn test_location_phrase_none_when_no_pattern() {
+        assert_eq!(
+            location_phrase("Service will originate / terminate at the Lake Street platform."),
+            None
+        );
     }
 
     // --- event_description ---
