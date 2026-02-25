@@ -2,9 +2,11 @@ use chrono::DateTime;
 use clap::{Arg, ArgAction, Command};
 use jluszcz_rust_utils::{Verbosity, set_up_logger};
 use log::debug;
-use mbtalerts::calendar::{CalendarClient, sync_alerts};
+use mbtalerts::APP_NAME;
+use mbtalerts::calendar::{
+    CalendarClient, event_summary, first_sentence, sync_alerts, uses_first_sentence_summary,
+};
 use mbtalerts::types::Alerts;
-use mbtalerts::{APP_NAME, line_name};
 
 const SEPARATOR: &str = "----------------------------------------";
 
@@ -55,26 +57,39 @@ fn parse_args() -> Args {
 
 fn format_dt(s: &str) -> String {
     DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.format("%-I:%M %p %m/%d/%Y").to_string())
+        .map(|dt| dt.format("%-m/%-d/%Y %-I:%M%p").to_string().to_lowercase())
         .unwrap_or_else(|_| s.to_owned())
 }
 
 fn format_alert(alert: &mbtalerts::types::Alert) -> String {
-    let line = line_name(alert);
     let effect = &alert.attributes.effect;
-    let period = alert.attributes.active_period.first();
-    let start = period
-        .and_then(|p| p.start.as_deref())
-        .map(format_dt)
-        .unwrap_or_else(|| "—".to_owned());
-    let end = period
-        .and_then(|p| p.end.as_deref())
-        .map(format_dt)
-        .unwrap_or_else(|| "-".to_owned());
-    format!(
-        "{effect}  {line}  {start}  {end}\n{}",
-        alert.attributes.header
-    )
+    let start = alert.period_start().map(format_dt);
+    let end = alert.period_end().map(format_dt);
+
+    let summary = event_summary(alert);
+    let formatted_summary = if let Some(close) = summary.find(']') {
+        let (prefix, rest) = summary.split_at(close + 1);
+        format!("\x1b[1m{prefix}\x1b[22m{rest}")
+    } else {
+        summary
+    };
+
+    let date_part = match (start, end) {
+        (Some(s), Some(e)) => format!(" - ({s} - {e})"),
+        (Some(s), None) => format!(" - ({s})"),
+        _ => String::new(),
+    };
+
+    let header = &alert.attributes.header;
+    let body: &str = if uses_first_sentence_summary(alert) {
+        let first = first_sentence(header);
+        let rest = header[first.len()..].trim_start_matches(['.', ' ']);
+        if rest.is_empty() { header } else { rest }
+    } else {
+        header
+    };
+
+    format!("{formatted_summary}{date_part}\n{effect} {body}")
 }
 
 fn print_alerts(alerts: &Alerts) {
@@ -137,31 +152,22 @@ mod test {
 
     #[test]
     fn test_format_dt_am() {
-        assert_eq!(
-            format_dt("2024-01-15T10:30:00-05:00"),
-            "10:30 AM 01/15/2024"
-        );
+        assert_eq!(format_dt("2024-01-15T10:30:00-05:00"), "1/15/2024 10:30am");
     }
 
     #[test]
     fn test_format_dt_pm() {
-        assert_eq!(format_dt("2024-01-15T14:45:00-05:00"), "2:45 PM 01/15/2024");
+        assert_eq!(format_dt("2024-01-15T14:45:00-05:00"), "1/15/2024 2:45pm");
     }
 
     #[test]
     fn test_format_dt_midnight() {
-        assert_eq!(
-            format_dt("2024-01-15T00:00:00-05:00"),
-            "12:00 AM 01/15/2024"
-        );
+        assert_eq!(format_dt("2024-01-15T00:00:00-05:00"), "1/15/2024 12:00am");
     }
 
     #[test]
     fn test_format_dt_noon() {
-        assert_eq!(
-            format_dt("2024-01-15T12:00:00-05:00"),
-            "12:00 PM 01/15/2024"
-        );
+        assert_eq!(format_dt("2024-01-15T12:00:00-05:00"), "1/15/2024 12:00pm");
     }
 
     #[test]
@@ -182,13 +188,13 @@ mod test {
         let output = format_alert(&alert);
         assert!(output.contains("DELAY"));
         assert!(output.contains("Red Line"));
-        assert!(output.contains("9:00 AM 06/01/2024"));
-        assert!(output.contains("11:00 PM 06/01/2024"));
+        assert!(output.contains("6/1/2024 9:00am"));
+        assert!(output.contains("6/1/2024 11:00pm"));
         assert!(output.contains("Service disruption in effect"));
     }
 
     #[test]
-    fn test_format_alert_no_period_uses_dashes() {
+    fn test_format_alert_no_period_shows_no_dates() {
         let alert = Alert {
             id: "test-id".to_owned(),
             attributes: AlertAttributes {
@@ -205,7 +211,7 @@ mod test {
         let output = format_alert(&alert);
         assert!(output.contains("SUSPENSION"));
         assert!(output.contains("Orange Line"));
-        assert!(output.contains('—'));
+        assert!(!output.contains('('));
     }
 
     #[test]

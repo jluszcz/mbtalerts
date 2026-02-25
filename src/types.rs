@@ -31,3 +31,13 @@ pub struct ActivePeriod {
 pub struct InformedEntity {
     pub route: Option<String>,
 }
+
+impl Alert {
+    pub fn period_start(&self) -> Option<&str> {
+        self.attributes.active_period.first()?.start.as_deref()
+    }
+
+    pub fn period_end(&self) -> Option<&str> {
+        self.attributes.active_period.first()?.end.as_deref()
+    }
+}

@@ -253,15 +253,23 @@ fn strip_line_prefix(header: &str) -> &str {
     header.trim_start()
 }
 
-fn effect_label(effect: &str) -> &str {
+pub fn effect_label(effect: &str) -> Option<&str> {
     match effect {
-        "SHUTTLE" => "Shuttle",
-        "DELAY" => "Delay",
-        "SUSPENSION" => "Suspension",
-        "SERVICE_CHANGE" => "Service change",
-        "SCHEDULE_CHANGE" => "Schedule change",
-        "DETOUR" => "Detour",
-        other => other,
+        "SHUTTLE" => Some("Shuttle"),
+        "DELAY" => Some("Delay"),
+        "SUSPENSION" => Some("Suspension"),
+        "SERVICE_CHANGE" => Some("Service change"),
+        "SCHEDULE_CHANGE" => Some("Schedule change"),
+        "DETOUR" => Some("Detour"),
+        _ => None,
+    }
+}
+
+pub fn first_sentence(s: &str) -> &str {
+    if let Some(pos) = s.find(". ") {
+        &s[..pos]
+    } else {
+        s.trim_end_matches('.')
     }
 }
 
@@ -299,6 +307,7 @@ const LOCATION_STOP_MARKERS: &[&str] = &[
     " this ",
     " that ",
     " from ",
+    " due ",
     " to allow",
     " in order",
     " starting",
@@ -333,20 +342,33 @@ fn location_phrase(content: &str) -> Option<String> {
     }
 }
 
-fn event_summary(alert: &Alert) -> String {
+pub fn event_summary(alert: &Alert) -> String {
     let line = crate::line_name(alert);
-    let label = effect_label(&alert.attributes.effect);
     let content = strip_line_prefix(&alert.attributes.header);
     if alert.attributes.effect == "DELAY"
         && let Some(duration) = delay_duration_phrase(content)
     {
         return format!("[{}] Delay {}", line, duration);
     }
-    if let Some(loc) = location_phrase(content) {
-        format!("[{}] {} {}", line, label, loc)
-    } else {
-        format!("[{}] {}", line, label)
+    if let Some(label) = effect_label(&alert.attributes.effect)
+        && let Some(loc) = location_phrase(content)
+    {
+        return format!("[{}] {} {}", line, label, loc);
     }
+    format!("[{}] {}", line, first_sentence(content))
+}
+
+/// Returns true when event_summary uses first_sentence as the title text,
+/// i.e. when no structured format (delay duration or location phrase) applies.
+pub fn uses_first_sentence_summary(alert: &Alert) -> bool {
+    let content = strip_line_prefix(&alert.attributes.header);
+    if alert.attributes.effect == "DELAY" && delay_duration_phrase(content).is_some() {
+        return false;
+    }
+    if effect_label(&alert.attributes.effect).is_some() && location_phrase(content).is_some() {
+        return false;
+    }
+    true
 }
 
 /// Builds the calendar event description from available alert fields.
@@ -365,11 +387,7 @@ fn event_description(alert: &Alert) -> String {
 }
 
 fn event_body(alert: &Alert) -> Value {
-    let period = alert.attributes.active_period.first();
-    let (start, end) = event_times(
-        period.and_then(|p| p.start.as_deref()),
-        period.and_then(|p| p.end.as_deref()),
-    );
+    let (start, end) = event_times(alert.period_start(), alert.period_end());
 
     json!({
         "summary": event_summary(alert),
@@ -493,7 +511,7 @@ mod test {
     // --- event_body ---
 
     #[test]
-    fn test_event_body_summary_delay_no_cause() {
+    fn test_event_body_summary_delay_no_duration_uses_first_sentence() {
         let alert = make_alert(
             "Red",
             "DELAY",
@@ -501,7 +519,7 @@ mod test {
             Some("2024-06-01T23:00:00-04:00"),
         );
         let body = event_body(&alert);
-        assert_eq!(body["summary"], "[Red Line] Delay");
+        assert_eq!(body["summary"], "[Red Line] Test header");
     }
 
     #[test]
@@ -531,7 +549,7 @@ mod test {
     }
 
     #[test]
-    fn test_event_body_summary_green_line_no_cause() {
+    fn test_event_body_summary_suspension_uses_first_sentence() {
         let alert = make_alert(
             "Green-B",
             "SUSPENSION",
@@ -539,11 +557,11 @@ mod test {
             None,
         );
         let body = event_body(&alert);
-        assert_eq!(body["summary"], "[Green Line] Suspension");
+        assert_eq!(body["summary"], "[Green Line] Test header");
     }
 
     #[test]
-    fn test_event_body_summary_service_change_with_cause() {
+    fn test_event_body_summary_service_change_no_location_uses_first_sentence() {
         let mut alert = make_alert(
             "MBTA",
             "SERVICE_CHANGE",
@@ -552,7 +570,10 @@ mod test {
         );
         alert.attributes.header = "Due to severe weather, Subway, Bus, and Commuter Rail are operating on a reduced schedule. Ferry service is canceled.".to_owned();
         let body = event_body(&alert);
-        assert_eq!(body["summary"], "[MBTA] Service change");
+        assert_eq!(
+            body["summary"],
+            "[MBTA] Due to severe weather, Subway, Bus, and Commuter Rail are operating on a reduced schedule"
+        );
     }
 
     #[test]
@@ -568,6 +589,38 @@ mod test {
         assert_eq!(
             body["summary"],
             "[Red Line] Shuttle between Broadway and Ashmont"
+        );
+    }
+
+    #[test]
+    fn test_event_body_summary_station_issue_uses_first_sentence() {
+        let mut alert = make_alert(
+            "Orange",
+            "STATION_ISSUE",
+            Some("2025-06-30T03:00:00-04:00"),
+            None,
+        );
+        alert.attributes.header = "Jackson Square: The stairway connecting the Jackson Sq lobby and the south end of the platform is closed until winter 2026. Use the stairway at the north end of the platform.".to_owned();
+        let body = event_body(&alert);
+        assert_eq!(
+            body["summary"],
+            "[Orange Line] Jackson Square: The stairway connecting the Jackson Sq lobby and the south end of the platform is closed until winter 2026"
+        );
+    }
+
+    #[test]
+    fn test_event_body_summary_shuttle_with_due_cause() {
+        let mut alert = make_alert(
+            "Blue",
+            "SHUTTLE",
+            Some("2026-02-25T05:13:00-05:00"),
+            Some("2026-02-25T08:27:00-05:00"),
+        );
+        alert.attributes.header = "Blue Line: Shuttle buses replacing service between Suffolk Downs and Maverick due to a power problem at Airport.".to_owned();
+        let body = event_body(&alert);
+        assert_eq!(
+            body["summary"],
+            "[Blue Line] Shuttle between Suffolk Downs and Maverick"
         );
     }
 
@@ -640,6 +693,16 @@ mod test {
     }
 
     #[test]
+    fn test_location_phrase_between_truncates_at_due() {
+        assert_eq!(
+            location_phrase(
+                "Shuttle buses replacing service between Suffolk Downs and Maverick due to a power problem at Airport."
+            ),
+            Some("between Suffolk Downs and Maverick".to_string())
+        );
+    }
+
+    #[test]
     fn test_location_phrase_from_to_without_through_returns_none() {
         assert_eq!(
             location_phrase("Shuttle buses replace service from North Station to Anderson/Woburn."),
@@ -707,22 +770,105 @@ mod test {
 
     #[test]
     fn test_effect_label_shuttle() {
-        assert_eq!(effect_label("SHUTTLE"), "Shuttle");
+        assert_eq!(effect_label("SHUTTLE"), Some("Shuttle"));
     }
 
     #[test]
     fn test_effect_label_service_change() {
-        assert_eq!(effect_label("SERVICE_CHANGE"), "Service change");
+        assert_eq!(effect_label("SERVICE_CHANGE"), Some("Service change"));
     }
 
     #[test]
     fn test_effect_label_delay() {
-        assert_eq!(effect_label("DELAY"), "Delay");
+        assert_eq!(effect_label("DELAY"), Some("Delay"));
     }
 
     #[test]
-    fn test_effect_label_unknown_passthrough() {
-        assert_eq!(effect_label("SOME_NEW_EFFECT"), "SOME_NEW_EFFECT");
+    fn test_effect_label_unknown_returns_none() {
+        assert_eq!(effect_label("STATION_ISSUE"), None);
+        assert_eq!(effect_label("SOME_NEW_EFFECT"), None);
+    }
+
+    // --- first_sentence ---
+
+    #[test]
+    fn test_first_sentence_multi_sentence() {
+        assert_eq!(
+            first_sentence("The elevator is closed. Use the stairs. Thank you."),
+            "The elevator is closed"
+        );
+    }
+
+    #[test]
+    fn test_first_sentence_single_with_period() {
+        assert_eq!(
+            first_sentence("The elevator is closed."),
+            "The elevator is closed"
+        );
+    }
+
+    #[test]
+    fn test_first_sentence_no_period() {
+        assert_eq!(
+            first_sentence("The elevator is closed"),
+            "The elevator is closed"
+        );
+    }
+
+    #[test]
+    fn test_first_sentence_station_prefix() {
+        assert_eq!(
+            first_sentence(
+                "Jackson Square: The stairway is closed until winter 2026. Use the other stairway."
+            ),
+            "Jackson Square: The stairway is closed until winter 2026"
+        );
+    }
+
+    // --- uses_first_sentence_summary ---
+
+    #[test]
+    fn test_uses_first_sentence_delay_with_duration_is_false() {
+        let mut alert = make_alert("Red", "DELAY", None, None);
+        alert.attributes.header =
+            "Red Line: Delays of about 20 minutes due to a signal problem.".to_owned();
+        assert!(!uses_first_sentence_summary(&alert));
+    }
+
+    #[test]
+    fn test_uses_first_sentence_delay_without_duration_is_true() {
+        let alert = make_alert("Red", "DELAY", None, None);
+        assert!(uses_first_sentence_summary(&alert));
+    }
+
+    #[test]
+    fn test_uses_first_sentence_shuttle_with_location_is_false() {
+        let mut alert = make_alert("Red", "SHUTTLE", None, None);
+        alert.attributes.header =
+            "Red Line: Shuttle buses will replace service between Broadway and Ashmont this weekend."
+                .to_owned();
+        assert!(!uses_first_sentence_summary(&alert));
+    }
+
+    #[test]
+    fn test_uses_first_sentence_shuttle_without_location_is_true() {
+        let alert = make_alert("Red", "SHUTTLE", None, None);
+        assert!(uses_first_sentence_summary(&alert));
+    }
+
+    #[test]
+    fn test_uses_first_sentence_service_change_no_location_is_true() {
+        let mut alert = make_alert("Blue", "SERVICE_CHANGE", None, None);
+        alert.attributes.header =
+            "Subway, Bus, and Ferry have returned to regular schedules. Storm cleanup continues."
+                .to_owned();
+        assert!(uses_first_sentence_summary(&alert));
+    }
+
+    #[test]
+    fn test_uses_first_sentence_unmapped_effect_is_true() {
+        let alert = make_alert("Orange", "STATION_ISSUE", None, None);
+        assert!(uses_first_sentence_summary(&alert));
     }
 
     // --- STATION_EFFECTS_TO_SKIP ---
