@@ -229,7 +229,10 @@ fn next_date(date: &str) -> String {
 
 fn event_times(start: Option<&str>, end: Option<&str>) -> (Value, Value) {
     match (start, end) {
-        (Some(s), Some(e)) => (json!({ "dateTime": s }), json!({ "dateTime": e })),
+        (Some(s), Some(e)) => (
+            json!({ "dateTime": s, "timeZone": "America/New_York" }),
+            json!({ "dateTime": e, "timeZone": "America/New_York" }),
+        ),
         (Some(s), None) => {
             // Open-ended alert: all-day event on the start date (end is exclusive in Google Calendar)
             let date = s.get(..10).unwrap_or(s);
@@ -479,8 +482,14 @@ mod test {
             Some("2024-01-15T10:00:00-05:00"),
             Some("2024-01-15T22:00:00-05:00"),
         );
-        assert_eq!(start, json!({ "dateTime": "2024-01-15T10:00:00-05:00" }));
-        assert_eq!(end, json!({ "dateTime": "2024-01-15T22:00:00-05:00" }));
+        assert_eq!(
+            start,
+            json!({ "dateTime": "2024-01-15T10:00:00-05:00", "timeZone": "America/New_York" })
+        );
+        assert_eq!(
+            end,
+            json!({ "dateTime": "2024-01-15T22:00:00-05:00", "timeZone": "America/New_York" })
+        );
     }
 
     #[test]
@@ -921,11 +930,11 @@ mod test {
         let body = event_body(&alert);
         assert_eq!(
             body["start"],
-            json!({ "dateTime": "2024-06-01T09:00:00-04:00" })
+            json!({ "dateTime": "2024-06-01T09:00:00-04:00", "timeZone": "America/New_York" })
         );
         assert_eq!(
             body["end"],
-            json!({ "dateTime": "2024-06-01T23:00:00-04:00" })
+            json!({ "dateTime": "2024-06-01T23:00:00-04:00", "timeZone": "America/New_York" })
         );
     }
 
