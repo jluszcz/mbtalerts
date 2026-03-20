@@ -9,18 +9,18 @@ terraform {
 # Sourced from environment variables named TF_VAR_${VAR_NAME}
 variable "aws_region" {}
 
-variable "code_bucket" {}
-
 variable calendar_id {}
 
 variable service_acct_key {}
+
+data "aws_caller_identity" "current" {}
 
 provider "aws" {
   region = var.aws_region
 }
 
 data "aws_s3_bucket" "code_bucket" {
-  bucket = var.code_bucket
+  bucket = format("code-%s-%s-an", data.aws_caller_identity.current.account_id, var.aws_region)
 }
 
 // Run every 3 hours
