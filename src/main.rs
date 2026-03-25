@@ -4,7 +4,8 @@ use jluszcz_rust_utils::{Verbosity, set_up_logger};
 use log::debug;
 use mbtalerts::APP_NAME;
 use mbtalerts::calendar::{
-    CalendarClient, event_summary, first_sentence, sync_alerts, uses_first_sentence_summary,
+    CalendarClient, LinePrefixMode, event_summary, first_sentence, sync_alerts,
+    uses_first_sentence_summary,
 };
 use mbtalerts::types::Alerts;
 
@@ -66,7 +67,7 @@ fn format_alert(alert: &mbtalerts::types::Alert) -> String {
     let start = alert.period_start().map(format_dt);
     let end = alert.period_end().map(format_dt);
 
-    let summary = event_summary(alert);
+    let summary = event_summary(alert, LinePrefixMode::Include);
     let formatted_summary = if let Some(close) = summary.find(']') {
         let (prefix, rest) = summary.split_at(close + 1);
         format!("\x1b[1m{prefix}\x1b[22m{rest}")
