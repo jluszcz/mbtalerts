@@ -9,7 +9,13 @@ terraform {
 # Sourced from environment variables named TF_VAR_${VAR_NAME}
 variable "aws_region" {}
 
-variable calendar_id {}
+variable "calendar_id" {
+  default = ""
+}
+
+variable "calendar_ids" {
+  default = ""
+}
 
 variable service_acct_key {}
 
@@ -98,10 +104,12 @@ resource "aws_lambda_function" "mbtalerts" {
   memory_size   = 128
 
   environment {
-    variables = {
-      GOOGLE_CALENDAR_ID          = var.calendar_id
-      GOOGLE_SERVICE_ACCOUNT_KEY  = var.service_acct_key
-    }
+    variables = merge(
+      {
+        GOOGLE_SERVICE_ACCOUNT_KEY = var.service_acct_key
+      },
+      var.calendar_ids != "" ? { GOOGLE_CALENDAR_IDS = var.calendar_ids } : { GOOGLE_CALENDAR_ID = var.calendar_id }
+    )
   }
 }
 
