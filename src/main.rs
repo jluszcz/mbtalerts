@@ -39,7 +39,7 @@ fn parse_args() -> Args {
                 .short('s')
                 .long("sync-calendar")
                 .action(ArgAction::SetTrue)
-                .help("Sync alerts to Google Calendar (requires GOOGLE_CALENDAR_ID and GOOGLE_SERVICE_ACCOUNT_KEY env vars)."),
+                .help("Sync alerts to Google Calendar (requires GOOGLE_SERVICE_ACCOUNT_KEY and either GOOGLE_CALENDAR_ID or GOOGLE_CALENDAR_IDS env vars)."),
         )
         .get_matches();
 

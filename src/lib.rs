@@ -11,16 +11,26 @@ pub mod types;
 
 pub const APP_NAME: &str = "mbtalerts";
 
+pub fn canonical_line(route: &str) -> Option<&'static str> {
+    match route {
+        "Red" => Some("Red"),
+        "Orange" => Some("Orange"),
+        "Blue" => Some("Blue"),
+        r if r.starts_with("Green") => Some("Green"),
+        _ => None,
+    }
+}
+
 pub fn line_name(alert: &Alert) -> &str {
     for entity in &alert.attributes.informed_entity {
         if let Some(route) = &entity.route {
-            return match route.as_str() {
-                "Red" => "Red Line",
-                "Orange" => "Orange Line",
-                "Blue" => "Blue Line",
-                r if r.starts_with("Green") => "Green Line",
-                r => {
-                    warn!("Unknown route '{r}', falling back to MBTA");
+            return match canonical_line(route) {
+                Some("Red") => "Red Line",
+                Some("Orange") => "Orange Line",
+                Some("Blue") => "Blue Line",
+                Some("Green") => "Green Line",
+                _ => {
+                    warn!("Unknown route '{route}', falling back to MBTA");
                     "MBTA"
                 }
             };
@@ -96,6 +106,41 @@ mod test {
         assert!(response.is_ok());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_canonical_line_red() {
+        assert_eq!(canonical_line("Red"), Some("Red"));
+    }
+
+    #[test]
+    fn test_canonical_line_orange() {
+        assert_eq!(canonical_line("Orange"), Some("Orange"));
+    }
+
+    #[test]
+    fn test_canonical_line_blue() {
+        assert_eq!(canonical_line("Blue"), Some("Blue"));
+    }
+
+    #[test]
+    fn test_canonical_line_green() {
+        assert_eq!(canonical_line("Green"), Some("Green"));
+    }
+
+    #[test]
+    fn test_canonical_line_green_b() {
+        assert_eq!(canonical_line("Green-B"), Some("Green"));
+    }
+
+    #[test]
+    fn test_canonical_line_green_e() {
+        assert_eq!(canonical_line("Green-E"), Some("Green"));
+    }
+
+    #[test]
+    fn test_canonical_line_unknown() {
+        assert_eq!(canonical_line("CR-Fitchburg"), None);
     }
 
     #[test]
