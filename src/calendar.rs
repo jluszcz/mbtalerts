@@ -303,28 +303,32 @@ pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
             .copied()
             .filter(|a| calendar_ids_for_alert(a, &cal.config).contains(&calendar_id))
             .collect();
-        let line_prefix = match &cal.config {
-            CalendarConfig::Single(_) => LinePrefixMode::Include,
-            CalendarConfig::PerLine { default, .. } => {
-                if calendar_id == default.as_str() {
-                    LinePrefixMode::Include
-                } else {
-                    LinePrefixMode::Omit
-                }
-            }
-        };
-        sync_calendar(cal, calendar_id, &cal_alerts, line_prefix).await?;
+        sync_calendar(cal, calendar_id, &cal_alerts).await?;
     }
 
     Ok(())
 }
 
-async fn sync_calendar(
-    cal: &CalendarClient,
+fn line_prefix_for_alert(
+    alert: &Alert,
     calendar_id: &str,
-    alerts: &[&Alert],
-    line_prefix: LinePrefixMode,
-) -> Result<()> {
+    config: &CalendarConfig,
+) -> LinePrefixMode {
+    let CalendarConfig::PerLine { map, .. } = config else {
+        return LinePrefixMode::Include;
+    };
+    for entity in &alert.attributes.informed_entity {
+        let Some(route) = &entity.route else { continue };
+        if let Some(line) = crate::canonical_line(route)
+            && map.get(line).map(String::as_str) == Some(calendar_id)
+        {
+            return LinePrefixMode::Omit;
+        }
+    }
+    LinePrefixMode::Include
+}
+
+async fn sync_calendar(cal: &CalendarClient, calendar_id: &str, alerts: &[&Alert]) -> Result<()> {
     let existing = cal.list_alert_events(calendar_id).await?;
 
     let mut existing_by_alert_id: HashMap<String, String> = HashMap::new();
@@ -337,6 +341,7 @@ async fn sync_calendar(
     let mut seen: HashSet<String> = HashSet::new();
 
     for alert in alerts {
+        let line_prefix = line_prefix_for_alert(alert, calendar_id, &cal.config);
         let summary = event_summary(alert, line_prefix);
         if let Some(event_id) = existing_by_alert_id.get(&alert.id) {
             debug!("Updating event for alert {}: {}", alert.id, summary);
@@ -801,6 +806,70 @@ mod test {
             body["summary"],
             "[Red Line] Service change between JFK/UMass and Ashmont"
         );
+    }
+
+    // --- line_prefix_for_alert ---
+
+    #[test]
+    fn test_line_prefix_single_config_always_include() {
+        let alert = make_alert("Red", "DELAY", None, None);
+        let config = CalendarConfig::Single("cal".to_string());
+        assert!(matches!(
+            line_prefix_for_alert(&alert, "cal", &config),
+            LinePrefixMode::Include
+        ));
+    }
+
+    #[test]
+    fn test_line_prefix_definitive_match_omits() {
+        let alert = make_alert("Red", "DELAY", None, None);
+        assert!(matches!(
+            line_prefix_for_alert(&alert, "cal-red", &per_line_config()),
+            LinePrefixMode::Omit
+        ));
+    }
+
+    #[test]
+    fn test_line_prefix_fallback_no_route_includes() {
+        let alert = Alert {
+            id: "x".to_owned(),
+            attributes: AlertAttributes {
+                header: "Test".to_owned(),
+                description: None,
+                url: None,
+                active_period: vec![],
+                effect: "DELAY".to_owned(),
+                informed_entity: vec![InformedEntity { route: None }],
+            },
+        };
+        assert!(matches!(
+            line_prefix_for_alert(&alert, "cal-default", &per_line_config()),
+            LinePrefixMode::Include
+        ));
+    }
+
+    #[test]
+    fn test_line_prefix_known_line_not_in_map_includes() {
+        // Line is identified as Red but Red has no calendar mapping
+        let alert = make_alert("Red", "DELAY", None, None);
+        let config = CalendarConfig::PerLine {
+            map: [("Orange".to_owned(), "cal-orange".to_owned())].into(),
+            default: "cal-default".to_owned(),
+        };
+        assert!(matches!(
+            line_prefix_for_alert(&alert, "cal-default", &config),
+            LinePrefixMode::Include
+        ));
+    }
+
+    #[test]
+    fn test_line_prefix_red_alert_on_default_calendar_includes() {
+        // Red is mapped to cal-red; a Red alert on the default calendar → Include
+        let alert = make_alert("Red", "DELAY", None, None);
+        assert!(matches!(
+            line_prefix_for_alert(&alert, "cal-default", &per_line_config()),
+            LinePrefixMode::Include
+        ));
     }
 
     // --- event_summary without line prefix (per-line calendar) ---
