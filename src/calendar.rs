@@ -93,8 +93,8 @@ impl CalendarEvent {
         self.get_private_property("mbta_ai_summary")
     }
 
-    fn alert_header_hash(&self) -> Option<&str> {
-        self.get_private_property("mbta_alert_header_hash")
+    fn alert_state_hash(&self) -> Option<&str> {
+        self.get_private_property("mbta_alert_state_hash")
     }
 }
 
@@ -351,13 +351,13 @@ fn line_prefix_for_alert(
 struct ExistingEvent {
     event_id: String,
     ai_summary: Option<String>,
-    header_hash: Option<String>,
+    state_hash: Option<String>,
 }
 
 struct SyncPlan<'a> {
     to_create: Vec<&'a Alert>,
     to_update: Vec<(String, &'a Alert)>, // (event_id, alert)
-    to_delete: Vec<(String, String)>,    // (event_id, alert_id) for logging
+    to_delete: Vec<String>,              // event_id
 }
 
 fn plan_calendar_sync<'a>(
@@ -369,11 +369,15 @@ fn plan_calendar_sync<'a>(
     let mut seen: HashSet<String> = HashSet::new();
 
     for alert in alerts {
-        let current_hash = header_hash(&alert.attributes.header);
+        let current_hash = event_state_hash(
+            &alert.attributes.header,
+            alert.period_start(),
+            alert.period_end(),
+        );
         match existing_by_alert_id.get(&alert.id) {
             Some(ExistingEvent {
                 ai_summary: Some(_),
-                header_hash: Some(cached_hash),
+                state_hash: Some(cached_hash),
                 ..
             }) if *cached_hash == current_hash => {
                 // Event exists and summary is already up-to-date; no write needed.
@@ -391,7 +395,7 @@ fn plan_calendar_sync<'a>(
     let to_delete = existing_by_alert_id
         .iter()
         .filter(|(alert_id, _)| !seen.contains(*alert_id))
-        .map(|(alert_id, existing)| (existing.event_id.clone(), alert_id.clone()))
+        .map(|(_, existing)| existing.event_id.clone())
         .collect();
 
     SyncPlan {
@@ -412,7 +416,7 @@ async fn sync_calendar(cal: &CalendarClient, calendar_id: &str, alerts: &[&Alert
                 ExistingEvent {
                     event_id: event.id.clone(),
                     ai_summary: event.ai_summary().map(str::to_owned),
-                    header_hash: event.alert_header_hash().map(str::to_owned),
+                    state_hash: event.alert_state_hash().map(str::to_owned),
                 },
             );
         }
@@ -447,7 +451,7 @@ async fn sync_calendar(cal: &CalendarClient, calendar_id: &str, alerts: &[&Alert
         .await?;
     }
 
-    for (event_id, _) in &plan.to_delete {
+    for event_id in &plan.to_delete {
         cal.delete_event(calendar_id, event_id).await?;
     }
 
@@ -664,13 +668,21 @@ fn event_description(alert: &Alert) -> String {
     parts.join("\n\n")
 }
 
-/// FNV-1a 64-bit hash — deterministic across platforms and Rust versions.
-fn header_hash(header: &str) -> String {
+/// FNV-1a 64-bit hash over header + active period bounds — deterministic across platforms and Rust versions.
+fn event_state_hash(header: &str, period_start: Option<&str>, period_end: Option<&str>) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in header.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
+    let feed = |hash: &mut u64, s: &str| {
+        for byte in s.bytes() {
+            *hash ^= byte as u64;
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+        // separator to prevent "ab"+"c" == "a"+"bc"
+        *hash ^= 0xff;
+        *hash = hash.wrapping_mul(0x100000001b3);
+    };
+    feed(&mut hash, header);
+    feed(&mut hash, period_start.unwrap_or(""));
+    feed(&mut hash, period_end.unwrap_or(""));
     hash.to_string()
 }
 
@@ -683,8 +695,12 @@ fn event_body(alert: &Alert, summary: &str, ai_summary_raw: Option<&str>) -> Val
     if let Some(raw) = ai_summary_raw {
         private.insert("mbta_ai_summary".to_owned(), json!(raw));
         private.insert(
-            "mbta_alert_header_hash".to_owned(),
-            json!(header_hash(&alert.attributes.header)),
+            "mbta_alert_state_hash".to_owned(),
+            json!(event_state_hash(
+                &alert.attributes.header,
+                alert.period_start(),
+                alert.period_end()
+            )),
         );
     }
 
@@ -1588,7 +1604,7 @@ mod test {
             ExistingEvent {
                 event_id: event_id.to_owned(),
                 ai_summary: ai_summary.map(str::to_owned),
-                header_hash: hash.map(str::to_owned),
+                state_hash: hash.map(str::to_owned),
             },
         )]
         .into()
@@ -1597,7 +1613,11 @@ mod test {
     #[test]
     fn test_plan_skip_when_hash_and_summary_match() {
         let alert = make_alert("Red", "DELAY", None, None);
-        let current_hash = header_hash(&alert.attributes.header);
+        let current_hash = event_state_hash(
+            &alert.attributes.header,
+            alert.period_start(),
+            alert.period_end(),
+        );
         let existing = make_existing(
             &alert.id,
             "event-1",
@@ -1634,7 +1654,11 @@ mod test {
     fn test_plan_update_when_ai_summary_missing() {
         // Event exists with matching hash but no AI summary — needs update to populate it.
         let alert = make_alert("Red", "DELAY", None, None);
-        let current_hash = header_hash(&alert.attributes.header);
+        let current_hash = event_state_hash(
+            &alert.attributes.header,
+            alert.period_start(),
+            alert.period_end(),
+        );
         let existing = make_existing(&alert.id, "event-1", None, Some(&current_hash));
 
         let plan = plan_calendar_sync(&existing, &[&alert]);
@@ -1664,8 +1688,7 @@ mod test {
         assert!(plan.to_create.is_empty());
         assert!(plan.to_update.is_empty());
         assert_eq!(plan.to_delete.len(), 1);
-        assert_eq!(plan.to_delete[0].0, "event-99");
-        assert_eq!(plan.to_delete[0].1, "stale-alert");
+        assert_eq!(plan.to_delete[0], "event-99");
     }
 
     #[test]
@@ -1676,14 +1699,18 @@ mod test {
         let mut alert_create = make_alert("Orange", "SHUTTLE", None, None);
         alert_create.id = "alert-create".to_owned();
 
-        let skip_hash = header_hash(&alert_skip.attributes.header);
+        let skip_hash = event_state_hash(
+            &alert_skip.attributes.header,
+            alert_skip.period_start(),
+            alert_skip.period_end(),
+        );
         let existing: HashMap<String, ExistingEvent> = [
             (
                 alert_skip.id.clone(),
                 ExistingEvent {
                     event_id: "event-skip".to_owned(),
                     ai_summary: Some("summary".to_owned()),
-                    header_hash: Some(skip_hash),
+                    state_hash: Some(skip_hash),
                 },
             ),
             (
@@ -1691,7 +1718,7 @@ mod test {
                 ExistingEvent {
                     event_id: "event-update".to_owned(),
                     ai_summary: Some("old".to_owned()),
-                    header_hash: Some("stale".to_owned()),
+                    state_hash: Some("stale".to_owned()),
                 },
             ),
             (
@@ -1699,7 +1726,7 @@ mod test {
                 ExistingEvent {
                     event_id: "event-stale".to_owned(),
                     ai_summary: Some("x".to_owned()),
-                    header_hash: Some("h".to_owned()),
+                    state_hash: Some("h".to_owned()),
                 },
             ),
         ]
@@ -1712,6 +1739,6 @@ mod test {
         assert_eq!(plan.to_update.len(), 1);
         assert_eq!(plan.to_update[0].0, "event-update");
         assert_eq!(plan.to_delete.len(), 1);
-        assert_eq!(plan.to_delete[0].1, "stale-alert");
+        assert_eq!(plan.to_delete[0], "event-stale");
     }
 }
