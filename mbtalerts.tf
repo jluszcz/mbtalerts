@@ -92,9 +92,14 @@ resource "aws_iam_role_policy_attachment" "basic_execution_role_attachment" {
 
 data "aws_iam_policy_document" "bedrock" {
   statement {
-    actions   = ["bedrock:InvokeModel"]
+    actions = ["bedrock:InvokeModel"]
     # Cross-region inference profiles route through multiple regions, so the wildcard region is required.
-    resources = ["arn:aws:bedrock:*::foundation-model/amazon.nova-2-lite-v1:0"]
+    # Both the foundation model and inference profile ARNs are needed: the profile is what gets invoked,
+    # and it in turn routes to the underlying foundation model.
+    resources = [
+      "arn:aws:bedrock:*::foundation-model/amazon.nova-2-lite-v1:0",
+      "arn:aws:bedrock:*:*:inference-profile/us.amazon.nova-2-lite-v1:0",
+    ]
   }
 }
 
