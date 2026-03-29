@@ -1,10 +1,11 @@
 use chrono::DateTime;
 use clap::{Arg, ArgAction, Command};
 use jluszcz_rust_utils::{Verbosity, set_up_logger};
-use log::debug;
+use log::{debug, warn};
 use mbtalerts::APP_NAME;
+use mbtalerts::ai::BedrockSummarizer;
 use mbtalerts::calendar::{
-    CalendarClient, LinePrefixMode, event_summary, first_sentence, sync_alerts,
+    CalendarClient, LinePrefixMode, event_summary, first_sentence, should_sync_alert, sync_alerts,
     uses_first_sentence_summary,
 };
 use mbtalerts::types::Alerts;
@@ -62,12 +63,26 @@ fn format_dt(s: &str) -> String {
         .unwrap_or_else(|_| s.to_owned())
 }
 
-fn format_alert(alert: &mbtalerts::types::Alert) -> String {
+async fn format_alert(
+    alert: &mbtalerts::types::Alert,
+    summarizer: Option<&BedrockSummarizer>,
+) -> String {
     let effect = &alert.attributes.effect;
     let start = alert.period_start().map(format_dt);
     let end = alert.period_end().map(format_dt);
 
-    let summary = event_summary(alert, LinePrefixMode::Include);
+    let summary = if let Some(s) = summarizer {
+        match s.generate_summary(&alert.attributes.header).await {
+            Ok(raw) => format!("[{}] {}", mbtalerts::line_name(alert), raw),
+            Err(e) => {
+                warn!("Bedrock inference failed for alert {}: {e:#}", alert.id);
+                event_summary(alert, LinePrefixMode::Include)
+            }
+        }
+    } else {
+        event_summary(alert, LinePrefixMode::Include)
+    };
+
     let formatted_summary = if let Some(close) = summary.find(']') {
         let (prefix, rest) = summary.split_at(close + 1);
         format!("\x1b[1m{prefix}\x1b[22m{rest}")
@@ -93,15 +108,15 @@ fn format_alert(alert: &mbtalerts::types::Alert) -> String {
     format!("{formatted_summary}{date_part}\n{effect} {body}")
 }
 
-fn print_alerts(alerts: &Alerts) {
-    if alerts.data.is_empty() {
-        println!("No active alerts.");
-        return;
-    }
-
-    for alert in &alerts.data {
+async fn print_alerts(alerts: &Alerts, summarizer: Option<&BedrockSummarizer>) {
+    let mut printed = false;
+    for alert in alerts.data.iter().filter(|a| should_sync_alert(a)) {
         println!("{SEPARATOR}");
-        println!("{}", format_alert(alert));
+        println!("{}", format_alert(alert, summarizer).await);
+        printed = true;
+    }
+    if !printed {
+        println!("No active alerts.");
     }
 }
 
@@ -119,7 +134,8 @@ async fn main() -> anyhow::Result<()> {
         let calendar = CalendarClient::from_env().await?;
         sync_alerts(&alerts, &calendar).await?;
     } else {
-        print_alerts(&alerts);
+        let summarizer = BedrockSummarizer::try_init().await;
+        print_alerts(&alerts, summarizer.as_ref()).await;
     }
 
     Ok(())
@@ -178,15 +194,15 @@ mod test {
 
     // --- format_alert ---
 
-    #[test]
-    fn test_format_alert_with_both_times() {
+    #[tokio::test]
+    async fn test_format_alert_with_both_times() {
         let alert = make_alert(
             "Red",
             "DELAY",
             Some("2024-06-01T09:00:00-04:00"),
             Some("2024-06-01T23:00:00-04:00"),
         );
-        let output = format_alert(&alert);
+        let output = format_alert(&alert, None).await;
         assert!(output.contains("DELAY"));
         assert!(output.contains("Red Line"));
         assert!(output.contains("6/1/2024 9:00am"));
@@ -194,8 +210,8 @@ mod test {
         assert!(output.contains("Service disruption in effect"));
     }
 
-    #[test]
-    fn test_format_alert_no_period_shows_no_dates() {
+    #[tokio::test]
+    async fn test_format_alert_no_period_shows_no_dates() {
         let alert = Alert {
             id: "test-id".to_owned(),
             attributes: AlertAttributes {
@@ -209,21 +225,21 @@ mod test {
                 }],
             },
         };
-        let output = format_alert(&alert);
+        let output = format_alert(&alert, None).await;
         assert!(output.contains("SUSPENSION"));
         assert!(output.contains("Orange Line"));
         assert!(!output.contains('('));
     }
 
-    #[test]
-    fn test_format_alert_green_line() {
+    #[tokio::test]
+    async fn test_format_alert_green_line() {
         let alert = make_alert(
             "Green-D",
             "DETOUR",
             Some("2024-06-01T08:00:00-04:00"),
             Some("2024-06-01T20:00:00-04:00"),
         );
-        let output = format_alert(&alert);
+        let output = format_alert(&alert, None).await;
         assert!(output.contains("Green Line"));
         assert!(output.contains("DETOUR"));
     }

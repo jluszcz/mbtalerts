@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use crate::ai::BedrockSummarizer;
 use crate::types::{Alert, Alerts};
 
 const CAL_API: &str = "https://www.googleapis.com/calendar/v3/calendars";
@@ -51,6 +52,7 @@ pub struct CalendarClient {
     token_provider: Arc<dyn TokenProvider>,
     config: CalendarConfig,
     client: Client,
+    summarizer: Option<BedrockSummarizer>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +82,24 @@ impl CalendarEvent {
             .private
             .as_ref()?
             .get("mbta_alert_id")
+            .map(String::as_str)
+    }
+
+    fn ai_summary(&self) -> Option<&str> {
+        self.extended_properties
+            .as_ref()?
+            .private
+            .as_ref()?
+            .get("mbta_ai_summary")
+            .map(String::as_str)
+    }
+
+    fn alert_header_hash(&self) -> Option<&str> {
+        self.extended_properties
+            .as_ref()?
+            .private
+            .as_ref()?
+            .get("mbta_alert_header_hash")
             .map(String::as_str)
     }
 }
@@ -122,10 +142,13 @@ impl CalendarClient {
             CalendarConfig::Single(normalize_calendar_id(id))
         };
 
+        let summarizer = BedrockSummarizer::try_init().await;
+
         Ok(Self {
             token_provider,
             config,
             client: Client::new(),
+            summarizer,
         })
     }
 
@@ -174,15 +197,16 @@ impl CalendarClient {
         &self,
         calendar_id: &str,
         alert: &Alert,
-        line_prefix: LinePrefixMode,
+        summary: &str,
+        ai_summary_raw: Option<&str>,
     ) -> Result<()> {
         let events_url = format!("{}/{}/events", CAL_API, calendar_id);
         debug!("Creating calendar event for alert {}", alert.id);
-        self.send_authenticated(
-            self.client
-                .post(&events_url)
-                .json(&event_body(alert, line_prefix)),
-        )
+        self.send_authenticated(self.client.post(&events_url).json(&event_body(
+            alert,
+            summary,
+            ai_summary_raw,
+        )))
         .await?;
         info!("Created calendar event for alert {}", alert.id);
         Ok(())
@@ -193,15 +217,16 @@ impl CalendarClient {
         calendar_id: &str,
         event_id: &str,
         alert: &Alert,
-        line_prefix: LinePrefixMode,
+        summary: &str,
+        ai_summary_raw: Option<&str>,
     ) -> Result<()> {
         let event_url = format!("{}/{}/events/{}", CAL_API, calendar_id, event_id);
         debug!("Updating calendar event {event_id} for alert {}", alert.id);
-        self.send_authenticated(
-            self.client
-                .put(&event_url)
-                .json(&event_body(alert, line_prefix)),
-        )
+        self.send_authenticated(self.client.put(&event_url).json(&event_body(
+            alert,
+            summary,
+            ai_summary_raw,
+        )))
         .await?;
         info!("Updated calendar event {event_id} for alert {}", alert.id);
         Ok(())
@@ -223,6 +248,10 @@ const STATION_EFFECTS_TO_SKIP: &[&str] = &[
     "STATION_CLOSURE",
     "PARKING_ISSUE",
 ];
+
+pub fn should_sync_alert(alert: &Alert) -> bool {
+    !STATION_EFFECTS_TO_SKIP.contains(&alert.attributes.effect.as_str())
+}
 
 fn calendar_ids_for_alert<'a>(alert: &Alert, config: &'a CalendarConfig) -> Vec<&'a str> {
     match config {
@@ -285,7 +314,7 @@ pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
         .data
         .iter()
         .filter(|a| {
-            if STATION_EFFECTS_TO_SKIP.contains(&a.attributes.effect.as_str()) {
+            if !should_sync_alert(a) {
                 debug!(
                     "Skipping station issue alert {}: {}",
                     a.id, a.attributes.effect
@@ -331,10 +360,18 @@ fn line_prefix_for_alert(
 async fn sync_calendar(cal: &CalendarClient, calendar_id: &str, alerts: &[&Alert]) -> Result<()> {
     let existing = cal.list_alert_events(calendar_id).await?;
 
-    let mut existing_by_alert_id: HashMap<String, String> = HashMap::new();
+    let mut existing_by_alert_id: HashMap<String, (String, Option<String>, Option<String>)> =
+        HashMap::new();
     for event in &existing {
         if let Some(alert_id) = event.alert_id() {
-            existing_by_alert_id.insert(alert_id.to_owned(), event.id.clone());
+            existing_by_alert_id.insert(
+                alert_id.to_owned(),
+                (
+                    event.id.clone(),
+                    event.ai_summary().map(str::to_owned),
+                    event.alert_header_hash().map(str::to_owned),
+                ),
+            );
         }
     }
 
@@ -342,19 +379,41 @@ async fn sync_calendar(cal: &CalendarClient, calendar_id: &str, alerts: &[&Alert
 
     for alert in alerts {
         let line_prefix = line_prefix_for_alert(alert, calendar_id, &cal.config);
-        let summary = event_summary(alert, line_prefix);
-        if let Some(event_id) = existing_by_alert_id.get(&alert.id) {
-            debug!("Updating event for alert {}: {}", alert.id, summary);
-            cal.update_event(calendar_id, event_id, alert, line_prefix)
-                .await?;
+
+        let (ai_summary_raw, display_summary) = match existing_by_alert_id.get(&alert.id) {
+            Some((_, Some(cached), Some(cached_hash)))
+                if cached_hash == &header_hash(&alert.attributes.header) =>
+            {
+                let display = apply_line_prefix(cached, alert, line_prefix);
+                (Some(cached.clone()), display)
+            }
+            _ => generate_or_fallback(cal.summarizer.as_ref(), alert, line_prefix).await,
+        };
+
+        if let Some((event_id, _, _)) = existing_by_alert_id.get(&alert.id) {
+            debug!("Updating event for alert {}: {}", alert.id, display_summary);
+            cal.update_event(
+                calendar_id,
+                event_id,
+                alert,
+                &display_summary,
+                ai_summary_raw.as_deref(),
+            )
+            .await?;
         } else {
-            debug!("Creating event for alert {}: {}", alert.id, summary);
-            cal.create_event(calendar_id, alert, line_prefix).await?;
+            debug!("Creating event for alert {}: {}", alert.id, display_summary);
+            cal.create_event(
+                calendar_id,
+                alert,
+                &display_summary,
+                ai_summary_raw.as_deref(),
+            )
+            .await?;
         }
         seen.insert(alert.id.clone());
     }
 
-    for (alert_id, event_id) in &existing_by_alert_id {
+    for (alert_id, (event_id, _, _)) in &existing_by_alert_id {
         if !seen.contains(alert_id) {
             info!("Deleting stale event for alert {}", alert_id);
             cal.delete_event(calendar_id, event_id).await?;
@@ -362,6 +421,32 @@ async fn sync_calendar(cal: &CalendarClient, calendar_id: &str, alerts: &[&Alert
     }
 
     Ok(())
+}
+
+fn apply_line_prefix(raw: &str, alert: &Alert, mode: LinePrefixMode) -> String {
+    match mode {
+        LinePrefixMode::Include => format!("[{}] {}", crate::line_name(alert), raw),
+        LinePrefixMode::Omit => raw.to_owned(),
+    }
+}
+
+async fn generate_or_fallback(
+    summarizer: Option<&BedrockSummarizer>,
+    alert: &Alert,
+    line_prefix: LinePrefixMode,
+) -> (Option<String>, String) {
+    if let Some(s) = summarizer {
+        match s.generate_summary(&alert.attributes.header).await {
+            Ok(raw) => {
+                let display = apply_line_prefix(&raw, alert, line_prefix);
+                return (Some(raw), display);
+            }
+            Err(e) => {
+                warn!("Bedrock inference failed for alert {}: {e:#}", alert.id);
+            }
+        }
+    }
+    (None, event_summary(alert, line_prefix))
 }
 
 fn next_date(date: &str) -> String {
@@ -393,7 +478,7 @@ fn event_times(start: Option<&str>, end: Option<&str>) -> (Value, Value) {
     }
 }
 
-fn strip_line_prefix(header: &str) -> &str {
+pub fn strip_line_prefix(header: &str) -> &str {
     if let Some(colon_idx) = header.find(": ") {
         let prefix = &header[..colon_idx];
         if prefix.contains("Line") && prefix.len() <= 35 {
@@ -548,20 +633,38 @@ fn event_description(alert: &Alert) -> String {
     parts.join("\n\n")
 }
 
-fn event_body(alert: &Alert, line_prefix: LinePrefixMode) -> Value {
+/// FNV-1a 64-bit hash — deterministic across platforms and Rust versions.
+fn header_hash(header: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in header.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash.to_string()
+}
+
+fn event_body(alert: &Alert, summary: &str, ai_summary_raw: Option<&str>) -> Value {
     let (start, end) = event_times(alert.period_start(), alert.period_end());
 
+    let mut private = serde_json::Map::new();
+    private.insert("mbta_alert_source".to_owned(), json!("true"));
+    private.insert("mbta_alert_id".to_owned(), json!(alert.id));
+    if let Some(raw) = ai_summary_raw {
+        private.insert("mbta_ai_summary".to_owned(), json!(raw));
+        private.insert(
+            "mbta_alert_header_hash".to_owned(),
+            json!(header_hash(&alert.attributes.header)),
+        );
+    }
+
     json!({
-        "summary": event_summary(alert, line_prefix),
+        "summary": summary,
         "description": event_description(alert),
         "start": start,
         "end": end,
         "transparency": "transparent",
         "extendedProperties": {
-            "private": {
-                "mbta_alert_source": "true",
-                "mbta_alert_id": alert.id,
-            }
+            "private": Value::Object(private)
         }
     })
 }
@@ -686,7 +789,8 @@ mod test {
             Some("2024-06-01T09:00:00-04:00"),
             Some("2024-06-01T23:00:00-04:00"),
         );
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(body["summary"], "[Red Line] Test header");
     }
 
@@ -699,7 +803,8 @@ mod test {
             Some("2026-02-23T13:47:00-05:00"),
         );
         alert.attributes.header = "Red Line Braintree Branch: Delays of about 20 minutes due to a signal problem at Braintree.".to_owned();
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(body["summary"], "[Red Line] Delay ~20 minutes");
     }
 
@@ -712,7 +817,8 @@ mod test {
             Some("2026-02-23T13:47:00-05:00"),
         );
         alert.attributes.header = "Blue Line: Delays of up to 20 minutes due to signal problem near Wonderland. Trains may stand by at stations.".to_owned();
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(body["summary"], "[Blue Line] Delay ~20 minutes");
     }
 
@@ -724,7 +830,8 @@ mod test {
             Some("2024-06-01T09:00:00-04:00"),
             None,
         );
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(body["summary"], "[Green Line] Test header");
     }
 
@@ -737,7 +844,8 @@ mod test {
             Some("2026-02-24T02:59:00-05:00"),
         );
         alert.attributes.header = "Due to severe weather, Subway, Bus, and Commuter Rail are operating on a reduced schedule. Ferry service is canceled.".to_owned();
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(
             body["summary"],
             "[MBTA] Due to severe weather, Subway, Bus, and Commuter Rail are operating on a reduced schedule"
@@ -753,7 +861,8 @@ mod test {
             Some("2024-06-01T23:00:00-04:00"),
         );
         alert.attributes.header = "Red Line: Shuttle buses will replace service between Broadway and Ashmont this weekend.".to_owned();
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(
             body["summary"],
             "[Red Line] Shuttle between Broadway and Ashmont"
@@ -769,7 +878,8 @@ mod test {
             None,
         );
         alert.attributes.header = "Jackson Square: The stairway connecting the Jackson Sq lobby and the south end of the platform is closed until winter 2026. Use the stairway at the north end of the platform.".to_owned();
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(
             body["summary"],
             "[Orange Line] Jackson Square: The stairway connecting the Jackson Sq lobby and the south end of the platform is closed until winter 2026"
@@ -785,7 +895,8 @@ mod test {
             Some("2026-02-25T08:27:00-05:00"),
         );
         alert.attributes.header = "Blue Line: Shuttle buses replacing service between Suffolk Downs and Maverick due to a power problem at Airport.".to_owned();
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(
             body["summary"],
             "[Blue Line] Shuttle between Suffolk Downs and Maverick"
@@ -801,7 +912,8 @@ mod test {
             Some("2024-06-01T23:00:00-04:00"),
         );
         alert.attributes.header = "Red Line Ashmont Branch: Service between JFK/UMass and Ashmont will operate with two shuttle trains from April 10 - 30 to allow for critical track work.".to_owned();
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(
             body["summary"],
             "[Red Line] Service change between JFK/UMass and Ashmont"
@@ -883,7 +995,8 @@ mod test {
             Some("2026-02-23T13:47:00-05:00"),
         );
         alert.attributes.header = "Red Line Braintree Branch: Delays of about 20 minutes due to a signal problem at Braintree.".to_owned();
-        let body = event_body(&alert, LinePrefixMode::Omit);
+        let summary = event_summary(&alert, LinePrefixMode::Omit);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(body["summary"], "Delay ~20 minutes");
     }
 
@@ -896,7 +1009,8 @@ mod test {
             Some("2024-06-01T23:00:00-04:00"),
         );
         alert.attributes.header = "Red Line: Shuttle buses will replace service between Broadway and Ashmont this weekend.".to_owned();
-        let body = event_body(&alert, LinePrefixMode::Omit);
+        let summary = event_summary(&alert, LinePrefixMode::Omit);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(body["summary"], "Shuttle between Broadway and Ashmont");
     }
 
@@ -908,7 +1022,8 @@ mod test {
             Some("2024-06-01T09:00:00-04:00"),
             Some("2024-06-01T23:00:00-04:00"),
         );
-        let body = event_body(&alert, LinePrefixMode::Omit);
+        let summary = event_summary(&alert, LinePrefixMode::Omit);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(body["summary"], "Test header");
     }
 
@@ -1178,7 +1293,8 @@ mod test {
             Some("2024-06-01T09:00:00-04:00"),
             Some("2024-06-01T23:00:00-04:00"),
         );
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(body["description"], "Test header\n\nTest description");
     }
 
@@ -1190,7 +1306,8 @@ mod test {
             Some("2024-06-01T09:00:00-04:00"),
             Some("2024-06-01T23:00:00-04:00"),
         );
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(
             body["start"],
             json!({ "dateTime": "2024-06-01T09:00:00-04:00", "timeZone": "America/New_York" })
@@ -1204,29 +1321,48 @@ mod test {
     #[test]
     fn test_event_body_dates_when_no_end() {
         let alert = make_alert("Red", "DELAY", Some("2024-06-01T09:00:00-04:00"), None);
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert_eq!(body["start"], json!({ "date": "2024-06-01" }));
         assert_eq!(body["end"], json!({ "date": "2024-06-02" }));
     }
 
     #[test]
-    fn test_event_body_extended_properties() {
+    fn test_event_body_extended_properties_without_ai_summary() {
         let alert = make_alert(
             "Red",
             "DELAY",
             Some("2024-06-01T09:00:00-04:00"),
             Some("2024-06-01T23:00:00-04:00"),
         );
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         let private = &body["extendedProperties"]["private"];
         assert_eq!(private["mbta_alert_source"], "true");
         assert_eq!(private["mbta_alert_id"], "alert-42");
+        assert!(private.get("mbta_ai_summary").is_none());
+    }
+
+    #[test]
+    fn test_event_body_extended_properties_with_ai_summary() {
+        let alert = make_alert(
+            "Red",
+            "DELAY",
+            Some("2024-06-01T09:00:00-04:00"),
+            Some("2024-06-01T23:00:00-04:00"),
+        );
+        let body = event_body(&alert, "AI-generated title", Some("AI-generated title"));
+        let private = &body["extendedProperties"]["private"];
+        assert_eq!(private["mbta_alert_source"], "true");
+        assert_eq!(private["mbta_alert_id"], "alert-42");
+        assert_eq!(private["mbta_ai_summary"], "AI-generated title");
     }
 
     #[test]
     fn test_event_body_no_period_falls_back_to_today() {
         let alert = make_alert_no_period("Orange", "SUSPENSION");
-        let body = event_body(&alert, LinePrefixMode::Include);
+        let summary = event_summary(&alert, LinePrefixMode::Include);
+        let body = event_body(&alert, &summary, None);
         assert!(body["start"].get("date").is_some());
         assert!(body["end"].get("date").is_some());
     }
