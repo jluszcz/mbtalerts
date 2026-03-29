@@ -5,6 +5,7 @@ use log::{trace, warn};
 use crate::mbta::query_subway_alerts;
 use crate::types::{Alert, Alerts};
 
+pub mod ai;
 pub mod calendar;
 pub mod mbta;
 pub mod types;

@@ -15,8 +15,10 @@ path = "src/lambda.rs"
 
 [dependencies]
 anyhow = "1.0"
+aws-config = "1"
+aws-sdk-bedrockruntime = "1"
 chrono = "0.4"
-clap = { version = "4.5", features = ["env"] }
+clap = { version = "4.6", features = ["env"] }
 gcp_auth = "0.12"
 jluszcz_rust_utils = { git = "https://github.com//jluszcz/rust-utils", features = ["query"] }
 lambda_runtime = "1.*"
