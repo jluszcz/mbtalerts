@@ -357,67 +357,107 @@ fn line_prefix_for_alert(
     LinePrefixMode::Include
 }
 
-async fn sync_calendar(cal: &CalendarClient, calendar_id: &str, alerts: &[&Alert]) -> Result<()> {
-    let existing = cal.list_alert_events(calendar_id).await?;
+struct ExistingEvent {
+    event_id: String,
+    ai_summary: Option<String>,
+    header_hash: Option<String>,
+}
 
-    let mut existing_by_alert_id: HashMap<String, (String, Option<String>, Option<String>)> =
-        HashMap::new();
-    for event in &existing {
-        if let Some(alert_id) = event.alert_id() {
-            existing_by_alert_id.insert(
-                alert_id.to_owned(),
-                (
-                    event.id.clone(),
-                    event.ai_summary().map(str::to_owned),
-                    event.alert_header_hash().map(str::to_owned),
-                ),
-            );
-        }
-    }
+struct SyncPlan<'a> {
+    to_create: Vec<&'a Alert>,
+    to_update: Vec<(String, &'a Alert)>, // (event_id, alert)
+    to_delete: Vec<(String, String)>,    // (event_id, alert_id) for logging
+}
 
+fn plan_calendar_sync<'a>(
+    existing_by_alert_id: &HashMap<String, ExistingEvent>,
+    alerts: &[&'a Alert],
+) -> SyncPlan<'a> {
+    let mut to_create = Vec::new();
+    let mut to_update = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
     for alert in alerts {
-        let line_prefix = line_prefix_for_alert(alert, calendar_id, &cal.config);
-
-        let (ai_summary_raw, display_summary) = match existing_by_alert_id.get(&alert.id) {
-            Some((_, Some(cached), Some(cached_hash)))
-                if cached_hash == &header_hash(&alert.attributes.header) =>
-            {
-                let display = apply_line_prefix(cached, alert, line_prefix);
-                (Some(cached.clone()), display)
+        let current_hash = header_hash(&alert.attributes.header);
+        match existing_by_alert_id.get(&alert.id) {
+            Some(ExistingEvent {
+                ai_summary: Some(_),
+                header_hash: Some(cached_hash),
+                ..
+            }) if *cached_hash == current_hash => {
+                // Event exists and summary is already up-to-date; no write needed.
             }
-            _ => generate_or_fallback(cal.summarizer.as_ref(), alert, line_prefix).await,
-        };
-
-        if let Some((event_id, _, _)) = existing_by_alert_id.get(&alert.id) {
-            debug!("Updating event for alert {}: {}", alert.id, display_summary);
-            cal.update_event(
-                calendar_id,
-                event_id,
-                alert,
-                &display_summary,
-                ai_summary_raw.as_deref(),
-            )
-            .await?;
-        } else {
-            debug!("Creating event for alert {}: {}", alert.id, display_summary);
-            cal.create_event(
-                calendar_id,
-                alert,
-                &display_summary,
-                ai_summary_raw.as_deref(),
-            )
-            .await?;
+            Some(ExistingEvent { event_id, .. }) => {
+                to_update.push((event_id.clone(), *alert));
+            }
+            None => {
+                to_create.push(*alert);
+            }
         }
         seen.insert(alert.id.clone());
     }
 
-    for (alert_id, (event_id, _, _)) in &existing_by_alert_id {
-        if !seen.contains(alert_id) {
-            info!("Deleting stale event for alert {}", alert_id);
-            cal.delete_event(calendar_id, event_id).await?;
+    let to_delete = existing_by_alert_id
+        .iter()
+        .filter(|(alert_id, _)| !seen.contains(*alert_id))
+        .map(|(alert_id, existing)| (existing.event_id.clone(), alert_id.clone()))
+        .collect();
+
+    SyncPlan {
+        to_create,
+        to_update,
+        to_delete,
+    }
+}
+
+async fn sync_calendar(cal: &CalendarClient, calendar_id: &str, alerts: &[&Alert]) -> Result<()> {
+    let existing = cal.list_alert_events(calendar_id).await?;
+
+    let mut existing_by_alert_id: HashMap<String, ExistingEvent> = HashMap::new();
+    for event in &existing {
+        if let Some(alert_id) = event.alert_id() {
+            existing_by_alert_id.insert(
+                alert_id.to_owned(),
+                ExistingEvent {
+                    event_id: event.id.clone(),
+                    ai_summary: event.ai_summary().map(str::to_owned),
+                    header_hash: event.alert_header_hash().map(str::to_owned),
+                },
+            );
         }
+    }
+
+    let plan = plan_calendar_sync(&existing_by_alert_id, alerts);
+
+    for alert in plan.to_create {
+        let line_prefix = line_prefix_for_alert(alert, calendar_id, &cal.config);
+        let (ai_summary_raw, display_summary) =
+            generate_or_fallback(cal.summarizer.as_ref(), alert, line_prefix).await;
+        cal.create_event(
+            calendar_id,
+            alert,
+            &display_summary,
+            ai_summary_raw.as_deref(),
+        )
+        .await?;
+    }
+
+    for (event_id, alert) in &plan.to_update {
+        let line_prefix = line_prefix_for_alert(alert, calendar_id, &cal.config);
+        let (ai_summary_raw, display_summary) =
+            generate_or_fallback(cal.summarizer.as_ref(), alert, line_prefix).await;
+        cal.update_event(
+            calendar_id,
+            event_id,
+            alert,
+            &display_summary,
+            ai_summary_raw.as_deref(),
+        )
+        .await?;
+    }
+
+    for (event_id, _) in &plan.to_delete {
+        cal.delete_event(calendar_id, event_id).await?;
     }
 
     Ok(())
@@ -1542,5 +1582,145 @@ mod test {
             extended_properties: Some(ExtendedProperties { private: None }),
         };
         assert_eq!(event.alert_id(), None);
+    }
+
+    // --- plan_calendar_sync ---
+
+    fn make_existing(
+        alert_id: &str,
+        event_id: &str,
+        ai_summary: Option<&str>,
+        hash: Option<&str>,
+    ) -> HashMap<String, ExistingEvent> {
+        [(
+            alert_id.to_owned(),
+            ExistingEvent {
+                event_id: event_id.to_owned(),
+                ai_summary: ai_summary.map(str::to_owned),
+                header_hash: hash.map(str::to_owned),
+            },
+        )]
+        .into()
+    }
+
+    #[test]
+    fn test_plan_skip_when_hash_and_summary_match() {
+        let alert = make_alert("Red", "DELAY", None, None);
+        let current_hash = header_hash(&alert.attributes.header);
+        let existing = make_existing(
+            &alert.id,
+            "event-1",
+            Some("AI summary"),
+            Some(&current_hash),
+        );
+
+        let plan = plan_calendar_sync(&existing, &[&alert]);
+
+        assert!(plan.to_create.is_empty(), "no creates expected");
+        assert!(plan.to_update.is_empty(), "no updates expected");
+        assert!(plan.to_delete.is_empty(), "no deletes expected");
+    }
+
+    #[test]
+    fn test_plan_update_when_hash_changed() {
+        let alert = make_alert("Red", "DELAY", None, None);
+        let existing = make_existing(
+            &alert.id,
+            "event-1",
+            Some("Old summary"),
+            Some("stale-hash"),
+        );
+
+        let plan = plan_calendar_sync(&existing, &[&alert]);
+
+        assert!(plan.to_create.is_empty());
+        assert_eq!(plan.to_update.len(), 1);
+        assert_eq!(plan.to_update[0].0, "event-1");
+        assert!(plan.to_delete.is_empty());
+    }
+
+    #[test]
+    fn test_plan_update_when_ai_summary_missing() {
+        // Event exists with matching hash but no AI summary — needs update to populate it.
+        let alert = make_alert("Red", "DELAY", None, None);
+        let current_hash = header_hash(&alert.attributes.header);
+        let existing = make_existing(&alert.id, "event-1", None, Some(&current_hash));
+
+        let plan = plan_calendar_sync(&existing, &[&alert]);
+
+        assert!(plan.to_create.is_empty());
+        assert_eq!(plan.to_update.len(), 1);
+    }
+
+    #[test]
+    fn test_plan_create_for_new_alert() {
+        let alert = make_alert("Red", "DELAY", None, None);
+        let existing = HashMap::new();
+
+        let plan = plan_calendar_sync(&existing, &[&alert]);
+
+        assert_eq!(plan.to_create.len(), 1);
+        assert!(plan.to_update.is_empty());
+        assert!(plan.to_delete.is_empty());
+    }
+
+    #[test]
+    fn test_plan_delete_stale_event() {
+        let existing = make_existing("stale-alert", "event-99", Some("summary"), Some("hash"));
+
+        let plan = plan_calendar_sync(&existing, &[]);
+
+        assert!(plan.to_create.is_empty());
+        assert!(plan.to_update.is_empty());
+        assert_eq!(plan.to_delete.len(), 1);
+        assert_eq!(plan.to_delete[0].0, "event-99");
+        assert_eq!(plan.to_delete[0].1, "stale-alert");
+    }
+
+    #[test]
+    fn test_plan_mixed_create_update_skip_delete() {
+        let alert_skip = make_alert("Red", "DELAY", None, None);
+        let mut alert_update = make_alert("Blue", "SUSPENSION", None, None);
+        alert_update.id = "alert-update".to_owned();
+        let mut alert_create = make_alert("Orange", "SHUTTLE", None, None);
+        alert_create.id = "alert-create".to_owned();
+
+        let skip_hash = header_hash(&alert_skip.attributes.header);
+        let existing: HashMap<String, ExistingEvent> = [
+            (
+                alert_skip.id.clone(),
+                ExistingEvent {
+                    event_id: "event-skip".to_owned(),
+                    ai_summary: Some("summary".to_owned()),
+                    header_hash: Some(skip_hash),
+                },
+            ),
+            (
+                alert_update.id.clone(),
+                ExistingEvent {
+                    event_id: "event-update".to_owned(),
+                    ai_summary: Some("old".to_owned()),
+                    header_hash: Some("stale".to_owned()),
+                },
+            ),
+            (
+                "stale-alert".to_owned(),
+                ExistingEvent {
+                    event_id: "event-stale".to_owned(),
+                    ai_summary: Some("x".to_owned()),
+                    header_hash: Some("h".to_owned()),
+                },
+            ),
+        ]
+        .into();
+
+        let plan = plan_calendar_sync(&existing, &[&alert_skip, &alert_update, &alert_create]);
+
+        assert_eq!(plan.to_create.len(), 1);
+        assert_eq!(plan.to_create[0].id, "alert-create");
+        assert_eq!(plan.to_update.len(), 1);
+        assert_eq!(plan.to_update[0].0, "event-update");
+        assert_eq!(plan.to_delete.len(), 1);
+        assert_eq!(plan.to_delete[0].1, "stale-alert");
     }
 }
