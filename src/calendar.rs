@@ -76,31 +76,25 @@ struct ExtendedProperties {
 }
 
 impl CalendarEvent {
-    fn alert_id(&self) -> Option<&str> {
+    fn get_private_property(&self, key: &str) -> Option<&str> {
         self.extended_properties
             .as_ref()?
             .private
             .as_ref()?
-            .get("mbta_alert_id")
+            .get(key)
             .map(String::as_str)
+    }
+
+    fn alert_id(&self) -> Option<&str> {
+        self.get_private_property("mbta_alert_id")
     }
 
     fn ai_summary(&self) -> Option<&str> {
-        self.extended_properties
-            .as_ref()?
-            .private
-            .as_ref()?
-            .get("mbta_ai_summary")
-            .map(String::as_str)
+        self.get_private_property("mbta_ai_summary")
     }
 
     fn alert_header_hash(&self) -> Option<&str> {
-        self.extended_properties
-            .as_ref()?
-            .private
-            .as_ref()?
-            .get("mbta_alert_header_hash")
-            .map(String::as_str)
+        self.get_private_property("mbta_alert_header_hash")
     }
 }
 
@@ -201,7 +195,6 @@ impl CalendarClient {
         ai_summary_raw: Option<&str>,
     ) -> Result<()> {
         let events_url = format!("{}/{}/events", CAL_API, calendar_id);
-        debug!("Creating calendar event for alert {}", alert.id);
         self.send_authenticated(self.client.post(&events_url).json(&event_body(
             alert,
             summary,
@@ -221,7 +214,6 @@ impl CalendarClient {
         ai_summary_raw: Option<&str>,
     ) -> Result<()> {
         let event_url = format!("{}/{}/events/{}", CAL_API, calendar_id, event_id);
-        debug!("Updating calendar event {event_id} for alert {}", alert.id);
         self.send_authenticated(self.client.put(&event_url).json(&event_body(
             alert,
             summary,
@@ -234,7 +226,6 @@ impl CalendarClient {
 
     async fn delete_event(&self, calendar_id: &str, event_id: &str) -> Result<()> {
         let event_url = format!("{}/{}/events/{}", CAL_API, calendar_id, event_id);
-        debug!("Deleting calendar event {event_id}");
         self.send_authenticated(self.client.delete(&event_url))
             .await?;
         info!("Deleted calendar event {event_id}");
@@ -470,7 +461,7 @@ fn apply_line_prefix(raw: &str, alert: &Alert, mode: LinePrefixMode) -> String {
     }
 }
 
-async fn generate_or_fallback(
+pub async fn generate_or_fallback(
     summarizer: Option<&BedrockSummarizer>,
     alert: &Alert,
     line_prefix: LinePrefixMode,

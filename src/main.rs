@@ -1,12 +1,12 @@
 use chrono::DateTime;
 use clap::{Arg, ArgAction, Command};
 use jluszcz_rust_utils::{Verbosity, set_up_logger};
-use log::{debug, warn};
+use log::debug;
 use mbtalerts::APP_NAME;
 use mbtalerts::ai::BedrockSummarizer;
 use mbtalerts::calendar::{
-    CalendarClient, LinePrefixMode, event_summary, first_sentence, should_sync_alert, sync_alerts,
-    uses_first_sentence_summary,
+    CalendarClient, LinePrefixMode, first_sentence, generate_or_fallback, should_sync_alert,
+    sync_alerts, uses_first_sentence_summary,
 };
 use mbtalerts::types::Alerts;
 
@@ -71,17 +71,7 @@ async fn format_alert(
     let start = alert.period_start().map(format_dt);
     let end = alert.period_end().map(format_dt);
 
-    let summary = if let Some(s) = summarizer {
-        match s.generate_summary(&alert.attributes.header).await {
-            Ok(raw) => format!("[{}] {}", mbtalerts::line_name(alert), raw),
-            Err(e) => {
-                warn!("Bedrock inference failed for alert {}: {e:#}", alert.id);
-                event_summary(alert, LinePrefixMode::Include)
-            }
-        }
-    } else {
-        event_summary(alert, LinePrefixMode::Include)
-    };
+    let (_, summary) = generate_or_fallback(summarizer, alert, LinePrefixMode::Include).await;
 
     let formatted_summary = if let Some(close) = summary.find(']') {
         let (prefix, rest) = summary.split_at(close + 1);
