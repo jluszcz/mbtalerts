@@ -8,6 +8,7 @@ use crate::types::{Alert, Alerts};
 pub mod ai;
 pub mod calendar;
 pub mod mbta;
+pub mod summary;
 pub mod types;
 
 pub const APP_NAME: &str = "mbtalerts";

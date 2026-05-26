@@ -1,8 +1,9 @@
 use anyhow::{Result, anyhow};
+use aws_sdk_bedrockruntime::config::ProvideCredentials;
 use aws_sdk_bedrockruntime::types::{ContentBlock, ConversationRole, Message};
-use log::{debug, warn};
+use log::debug;
 
-use crate::calendar::strip_line_prefix;
+use crate::summary::strip_line_prefix;
 
 const DEFAULT_MODEL_ID: &str = "us.amazon.nova-2-lite-v1:0";
 
@@ -12,22 +13,21 @@ pub struct BedrockSummarizer {
 }
 
 impl BedrockSummarizer {
-    pub async fn from_env() -> Result<Self> {
+    /// Returns `None` when AWS credentials are not configured. The CLI runs without
+    /// credentials in local use; the Lambda is always credentialed.
+    pub async fn from_env() -> Option<Self> {
         let config = aws_config::from_env().load().await;
-        let client = aws_sdk_bedrockruntime::Client::new(&config);
+        let provider = config.credentials_provider()?;
+        if let Err(e) = provider.provide_credentials().await {
+            debug!("AWS credentials unavailable; skipping Bedrock summaries: {e}");
+            return None;
+        }
         let model_id =
             std::env::var("BEDROCK_MODEL_ID").unwrap_or_else(|_| DEFAULT_MODEL_ID.to_owned());
-        Ok(Self { client, model_id })
-    }
-
-    pub async fn try_init() -> Option<Self> {
-        Self::from_env()
-            .await
-            .map_err(|e| {
-                warn!("Bedrock unavailable, falling back to hardcoded summaries: {e}");
-                e
-            })
-            .ok()
+        Some(Self {
+            client: aws_sdk_bedrockruntime::Client::new(&config),
+            model_id,
+        })
     }
 
     pub async fn generate_summary(&self, header: &str) -> Result<String> {

@@ -1,44 +1,19 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use gcp_auth::{CustomServiceAccount, TokenProvider};
 use log::{debug, info, warn};
-use reqwest::Client;
+use reqwest::{Client, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::ai::BedrockSummarizer;
+use crate::summary::{LinePrefixMode, generate_or_fallback};
 use crate::types::{Alert, Alerts};
 
 const CAL_API: &str = "https://www.googleapis.com/calendar/v3/calendars";
-const SCOPES: &[&str] = &["https://www.googleapis.com/auth/calendar"];
-
-struct SecretString(String);
-
-impl SecretString {
-    fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for SecretString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("[REDACTED]")
-    }
-}
-
-impl std::fmt::Debug for SecretString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum LinePrefixMode {
-    Include,
-    Omit,
-}
+const SCOPES: &[&str] = &["https://www.googleapis.com/auth/calendar.events"];
 
 pub enum CalendarConfig {
     Single(String),
@@ -100,6 +75,16 @@ impl CalendarEvent {
 
 const CALENDAR_ID_SUFFIX: &str = "@group.calendar.google.com";
 
+async fn check_status(response: Response) -> Result<Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let url = response.url().clone();
+    let body = response.text().await.unwrap_or_default();
+    Err(anyhow!("HTTP {status} from {url}: {body}"))
+}
+
 fn normalize_calendar_id(id: String) -> String {
     if id.ends_with(CALENDAR_ID_SUFFIX) {
         id
@@ -111,10 +96,9 @@ fn normalize_calendar_id(id: String) -> String {
 impl CalendarClient {
     pub async fn from_env() -> Result<Self> {
         let key_json = std::env::var("GOOGLE_SERVICE_ACCOUNT_KEY")
-            .map(SecretString)
             .context("GOOGLE_SERVICE_ACCOUNT_KEY env var not set")?;
         let token_provider: Arc<dyn TokenProvider> =
-            Arc::new(CustomServiceAccount::from_json(key_json.expose())?);
+            Arc::new(CustomServiceAccount::from_json(&key_json)?);
 
         let config = if let Ok(json_str) = std::env::var("GOOGLE_CALENDAR_IDS") {
             let raw: HashMap<String, String> =
@@ -136,7 +120,7 @@ impl CalendarClient {
             CalendarConfig::Single(normalize_calendar_id(id))
         };
 
-        let summarizer = BedrockSummarizer::try_init().await;
+        let summarizer = BedrockSummarizer::from_env().await;
 
         Ok(Self {
             token_provider,
@@ -151,9 +135,9 @@ impl CalendarClient {
         Ok(token.as_str().to_owned())
     }
 
-    async fn send_authenticated(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    async fn send_authenticated(&self, req: reqwest::RequestBuilder) -> Result<Response> {
         let token = self.access_token().await?;
-        Ok(req.bearer_auth(&token).send().await?.error_for_status()?)
+        check_status(req.bearer_auth(&token).send().await?).await
     }
 
     async fn list_alert_events(&self, calendar_id: &str) -> Result<Vec<CalendarEvent>> {
@@ -174,7 +158,7 @@ impl CalendarClient {
                 req = req.query(&[("pageToken", pt.as_str())]);
             }
 
-            let response: EventList = req.send().await?.error_for_status()?.json().await?;
+            let response: EventList = check_status(req.send().await?).await?.json().await?;
             events.extend(response.items);
 
             match response.next_page_token {
@@ -195,12 +179,9 @@ impl CalendarClient {
         ai_summary_raw: Option<&str>,
     ) -> Result<()> {
         let events_url = format!("{}/{}/events", CAL_API, calendar_id);
-        self.send_authenticated(self.client.post(&events_url).json(&event_body(
-            alert,
-            summary,
-            ai_summary_raw,
-        )))
-        .await?;
+        let body = event_body(alert, summary, ai_summary_raw)?;
+        self.send_authenticated(self.client.post(&events_url).json(&body))
+            .await?;
         info!("Created calendar event for alert {}", alert.id);
         Ok(())
     }
@@ -214,12 +195,9 @@ impl CalendarClient {
         ai_summary_raw: Option<&str>,
     ) -> Result<()> {
         let event_url = format!("{}/{}/events/{}", CAL_API, calendar_id, event_id);
-        self.send_authenticated(self.client.put(&event_url).json(&event_body(
-            alert,
-            summary,
-            ai_summary_raw,
-        )))
-        .await?;
+        let body = event_body(alert, summary, ai_summary_raw)?;
+        self.send_authenticated(self.client.put(&event_url).json(&body))
+            .await?;
         info!("Updated calendar event {event_id} for alert {}", alert.id);
         Ok(())
     }
@@ -317,14 +295,16 @@ pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
         })
         .collect();
 
-    for calendar_id in calendar_ids {
+    let tasks = calendar_ids.into_iter().map(|calendar_id| {
         let cal_alerts: Vec<&Alert> = sync_alerts
             .iter()
             .copied()
             .filter(|a| calendar_ids_for_alert(a, &cal.config).contains(&calendar_id))
             .collect();
-        sync_calendar(cal, calendar_id, &cal_alerts).await?;
-    }
+        async move { sync_calendar(cal, calendar_id, &cal_alerts).await }
+    });
+
+    futures::future::try_join_all(tasks).await?;
 
     Ok(())
 }
@@ -369,11 +349,7 @@ fn plan_calendar_sync<'a>(
     let mut seen: HashSet<String> = HashSet::new();
 
     for alert in alerts {
-        let current_hash = event_state_hash(
-            &alert.attributes.header,
-            alert.period_start(),
-            alert.period_end(),
-        );
+        let current_hash = event_state_hash(alert);
         match existing_by_alert_id.get(&alert.id) {
             Some(ExistingEvent {
                 ai_summary: Some(_),
@@ -458,199 +434,31 @@ async fn sync_calendar(cal: &CalendarClient, calendar_id: &str, alerts: &[&Alert
     Ok(())
 }
 
-fn apply_line_prefix(raw: &str, alert: &Alert, mode: LinePrefixMode) -> String {
-    match mode {
-        LinePrefixMode::Include => format!("[{}] {}", crate::line_name(alert), raw),
-        LinePrefixMode::Omit => raw.to_owned(),
-    }
+fn next_date(date: &str) -> Result<String> {
+    let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .with_context(|| format!("Failed to parse date {date:?} as %Y-%m-%d"))?;
+    Ok((parsed + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string())
 }
 
-pub async fn generate_or_fallback(
-    summarizer: Option<&BedrockSummarizer>,
-    alert: &Alert,
-    line_prefix: LinePrefixMode,
-) -> (Option<String>, String) {
-    if let Some(s) = summarizer {
-        match s.generate_summary(&alert.attributes.header).await {
-            Ok(raw) => {
-                let display = apply_line_prefix(&raw, alert, line_prefix);
-                return (Some(raw), display);
-            }
-            Err(e) => {
-                warn!("Bedrock inference failed for alert {}: {e:#}", alert.id);
-            }
-        }
-    }
-    (None, event_summary(alert, line_prefix))
-}
-
-fn next_date(date: &str) -> String {
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map(|d| {
-            (d + chrono::Duration::days(1))
-                .format("%Y-%m-%d")
-                .to_string()
-        })
-        .unwrap_or_else(|_| date.to_string())
-}
-
-fn event_times(start: Option<&str>, end: Option<&str>) -> (Value, Value) {
+fn event_times(start: Option<&str>, end: Option<&str>) -> Result<(Value, Value)> {
     match (start, end) {
-        (Some(s), Some(e)) => (
+        (Some(s), Some(e)) => Ok((
             json!({ "dateTime": s, "timeZone": "America/New_York" }),
             json!({ "dateTime": e, "timeZone": "America/New_York" }),
-        ),
+        )),
         (Some(s), None) => {
             // Open-ended alert: all-day event on the start date (end is exclusive in Google Calendar)
             let date = s.get(..10).unwrap_or(s);
-            (json!({ "date": date }), json!({ "date": next_date(date) }))
+            Ok((json!({ "date": date }), json!({ "date": next_date(date)? })))
         }
         _ => {
             let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            let tomorrow = next_date(&today);
-            (json!({ "date": today }), json!({ "date": tomorrow }))
+            let tomorrow = next_date(&today)?;
+            Ok((json!({ "date": today }), json!({ "date": tomorrow })))
         }
     }
-}
-
-pub fn strip_line_prefix(header: &str) -> &str {
-    if let Some(colon_idx) = header.find(": ") {
-        let prefix = &header[..colon_idx];
-        if prefix.contains("Line") && prefix.len() <= 35 {
-            return header[colon_idx + 2..].trim_start();
-        }
-    }
-    header.trim_start()
-}
-
-pub fn effect_label(effect: &str) -> Option<&str> {
-    match effect {
-        "SHUTTLE" => Some("Shuttle"),
-        "DELAY" => Some("Delay"),
-        "SUSPENSION" => Some("Suspension"),
-        "SERVICE_CHANGE" => Some("Service change"),
-        "SCHEDULE_CHANGE" => Some("Schedule change"),
-        "DETOUR" => Some("Detour"),
-        _ => None,
-    }
-}
-
-pub fn first_sentence(s: &str) -> &str {
-    if let Some(pos) = s.find(". ") {
-        &s[..pos]
-    } else {
-        s.trim_end_matches('.')
-    }
-}
-
-/// For DELAY effects, extract "~N minutes" from content like
-/// "Delays of about 20 minutes due to signal problem".
-fn delay_duration_phrase(content: &str) -> Option<String> {
-    let lower = content.to_lowercase();
-    let words: Vec<&str> = lower.split_whitespace().collect();
-    let min_pos = words.iter().position(|w| w.starts_with("minute"))?;
-    if min_pos == 0 {
-        return None;
-    }
-    // "N to M minutes" pattern
-    if min_pos >= 3
-        && words[min_pos - 2] == "to"
-        && words[min_pos - 1].chars().all(|c| c.is_ascii_digit())
-        && words[min_pos - 3].chars().all(|c| c.is_ascii_digit())
-    {
-        return Some(format!(
-            "~{}-{} minutes",
-            words[min_pos - 3],
-            words[min_pos - 1]
-        ));
-    }
-    // "N minutes" pattern
-    if words[min_pos - 1].chars().all(|c| c.is_ascii_digit()) {
-        return Some(format!("~{} minutes", words[min_pos - 1]));
-    }
-    None
-}
-
-const LOCATION_STOP_MARKERS: &[&str] = &[
-    ", ",
-    " will ",
-    " this ",
-    " that ",
-    " from ",
-    " due ",
-    " to allow",
-    " in order",
-    " starting",
-    " during",
-];
-
-/// Extract a location phrase ("between A and B" or "from A through B") from stripped content.
-fn location_phrase(content: &str) -> Option<String> {
-    let fragment = if let Some(idx) = content.find(" between ") {
-        &content[idx + 1..]
-    } else if let Some(idx) = content.find(" from ") {
-        let candidate = &content[idx + 1..];
-        if !candidate.contains(" through ") {
-            return None;
-        }
-        candidate
-    } else {
-        return None;
-    };
-
-    let end = LOCATION_STOP_MARKERS
-        .iter()
-        .filter_map(|m| fragment.find(m))
-        .min()
-        .unwrap_or(fragment.len());
-
-    let phrase = fragment[..end].trim_end_matches(['.', ',', ' ']);
-    if phrase.is_empty() {
-        None
-    } else {
-        Some(phrase.to_string())
-    }
-}
-
-pub fn event_summary(alert: &Alert, line_prefix: LinePrefixMode) -> String {
-    let content = strip_line_prefix(&alert.attributes.header);
-    if alert.attributes.effect == "DELAY"
-        && let Some(duration) = delay_duration_phrase(content)
-    {
-        return match line_prefix {
-            LinePrefixMode::Include => format!("[{}] Delay {}", crate::line_name(alert), duration),
-            LinePrefixMode::Omit => format!("Delay {}", duration),
-        };
-    }
-    if let Some(label) = effect_label(&alert.attributes.effect)
-        && let Some(loc) = location_phrase(content)
-    {
-        return match line_prefix {
-            LinePrefixMode::Include => {
-                format!("[{}] {} {}", crate::line_name(alert), label, loc)
-            }
-            LinePrefixMode::Omit => format!("{} {}", label, loc),
-        };
-    }
-    match line_prefix {
-        LinePrefixMode::Include => {
-            format!("[{}] {}", crate::line_name(alert), first_sentence(content))
-        }
-        LinePrefixMode::Omit => first_sentence(content).to_owned(),
-    }
-}
-
-/// Returns true when event_summary uses first_sentence as the title text,
-/// i.e. when no structured format (delay duration or location phrase) applies.
-pub fn uses_first_sentence_summary(alert: &Alert) -> bool {
-    let content = strip_line_prefix(&alert.attributes.header);
-    if alert.attributes.effect == "DELAY" && delay_duration_phrase(content).is_some() {
-        return false;
-    }
-    if effect_label(&alert.attributes.effect).is_some() && location_phrase(content).is_some() {
-        return false;
-    }
-    true
 }
 
 /// Builds the calendar event description from available alert fields.
@@ -668,8 +476,9 @@ fn event_description(alert: &Alert) -> String {
     parts.join("\n\n")
 }
 
-/// FNV-1a 64-bit hash over header + active period bounds — deterministic across platforms and Rust versions.
-fn event_state_hash(header: &str, period_start: Option<&str>, period_end: Option<&str>) -> String {
+/// FNV-1a 64-bit hash over header, description, url, and active period bounds —
+/// deterministic across platforms and Rust versions.
+fn event_state_hash(alert: &Alert) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     let feed = |hash: &mut u64, s: &str| {
         for byte in s.bytes() {
@@ -680,14 +489,19 @@ fn event_state_hash(header: &str, period_start: Option<&str>, period_end: Option
         *hash ^= 0xff;
         *hash = hash.wrapping_mul(0x100000001b3);
     };
-    feed(&mut hash, header);
-    feed(&mut hash, period_start.unwrap_or(""));
-    feed(&mut hash, period_end.unwrap_or(""));
+    feed(&mut hash, &alert.attributes.header);
+    feed(
+        &mut hash,
+        alert.attributes.description.as_deref().unwrap_or(""),
+    );
+    feed(&mut hash, alert.attributes.url.as_deref().unwrap_or(""));
+    feed(&mut hash, alert.period_start().unwrap_or(""));
+    feed(&mut hash, alert.period_end().unwrap_or(""));
     hash.to_string()
 }
 
-fn event_body(alert: &Alert, summary: &str, ai_summary_raw: Option<&str>) -> Value {
-    let (start, end) = event_times(alert.period_start(), alert.period_end());
+fn event_body(alert: &Alert, summary: &str, ai_summary_raw: Option<&str>) -> Result<Value> {
+    let (start, end) = event_times(alert.period_start(), alert.period_end())?;
 
     let mut private = serde_json::Map::new();
     private.insert("mbta_alert_source".to_owned(), json!("true"));
@@ -696,15 +510,11 @@ fn event_body(alert: &Alert, summary: &str, ai_summary_raw: Option<&str>) -> Val
         private.insert("mbta_ai_summary".to_owned(), json!(raw));
         private.insert(
             "mbta_alert_state_hash".to_owned(),
-            json!(event_state_hash(
-                &alert.attributes.header,
-                alert.period_start(),
-                alert.period_end()
-            )),
+            json!(event_state_hash(alert)),
         );
     }
 
-    json!({
+    Ok(json!({
         "summary": summary,
         "description": event_description(alert),
         "start": start,
@@ -713,12 +523,13 @@ fn event_body(alert: &Alert, summary: &str, ai_summary_raw: Option<&str>) -> Val
         "extendedProperties": {
             "private": Value::Object(private)
         }
-    })
+    }))
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::summary::event_summary;
     use crate::types::{ActivePeriod, AlertAttributes, InformedEntity};
 
     fn make_alert(route: &str, effect: &str, start: Option<&str>, end: Option<&str>) -> Alert {
@@ -760,27 +571,27 @@ mod test {
 
     #[test]
     fn test_next_date_normal() {
-        assert_eq!(next_date("2024-03-15"), "2024-03-16");
+        assert_eq!(next_date("2024-03-15").unwrap(), "2024-03-16");
     }
 
     #[test]
     fn test_next_date_month_boundary() {
-        assert_eq!(next_date("2024-01-31"), "2024-02-01");
+        assert_eq!(next_date("2024-01-31").unwrap(), "2024-02-01");
     }
 
     #[test]
     fn test_next_date_year_boundary() {
-        assert_eq!(next_date("2024-12-31"), "2025-01-01");
+        assert_eq!(next_date("2024-12-31").unwrap(), "2025-01-01");
     }
 
     #[test]
     fn test_next_date_leap_day() {
-        assert_eq!(next_date("2024-02-29"), "2024-03-01");
+        assert_eq!(next_date("2024-02-29").unwrap(), "2024-03-01");
     }
 
     #[test]
-    fn test_next_date_invalid_passthrough() {
-        assert_eq!(next_date("not-a-date"), "not-a-date");
+    fn test_next_date_invalid_errors() {
+        assert!(next_date("not-a-date").is_err());
     }
 
     // --- event_times ---
@@ -790,7 +601,8 @@ mod test {
         let (start, end) = event_times(
             Some("2024-01-15T10:00:00-05:00"),
             Some("2024-01-15T22:00:00-05:00"),
-        );
+        )
+        .unwrap();
         assert_eq!(
             start,
             json!({ "dateTime": "2024-01-15T10:00:00-05:00", "timeZone": "America/New_York" })
@@ -803,27 +615,27 @@ mod test {
 
     #[test]
     fn test_event_times_start_only_uses_date_format() {
-        let (start, end) = event_times(Some("2024-01-15T10:00:00-05:00"), None);
+        let (start, end) = event_times(Some("2024-01-15T10:00:00-05:00"), None).unwrap();
         assert_eq!(start, json!({ "date": "2024-01-15" }));
         assert_eq!(end, json!({ "date": "2024-01-16" }));
     }
 
     #[test]
     fn test_event_times_start_only_month_boundary() {
-        let (start, end) = event_times(Some("2024-03-31T08:00:00-04:00"), None);
+        let (start, end) = event_times(Some("2024-03-31T08:00:00-04:00"), None).unwrap();
         assert_eq!(start, json!({ "date": "2024-03-31" }));
         assert_eq!(end, json!({ "date": "2024-04-01" }));
     }
 
     #[test]
     fn test_event_times_neither_returns_today_tomorrow() {
-        let (start, end) = event_times(None, None);
+        let (start, end) = event_times(None, None).unwrap();
         assert!(start.get("date").is_some(), "start should have 'date' key");
         assert!(end.get("date").is_some(), "end should have 'date' key");
         // end date is day after start date
         let start_date = start["date"].as_str().unwrap();
         let end_date = end["date"].as_str().unwrap();
-        assert_eq!(next_date(start_date), end_date);
+        assert_eq!(next_date(start_date).unwrap(), end_date);
     }
 
     // --- event_body ---
@@ -837,7 +649,7 @@ mod test {
             Some("2024-06-01T23:00:00-04:00"),
         );
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(body["summary"], "[Red Line] Test header");
     }
 
@@ -851,7 +663,7 @@ mod test {
         );
         alert.attributes.header = "Red Line Braintree Branch: Delays of about 20 minutes due to a signal problem at Braintree.".to_owned();
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(body["summary"], "[Red Line] Delay ~20 minutes");
     }
 
@@ -865,7 +677,7 @@ mod test {
         );
         alert.attributes.header = "Blue Line: Delays of up to 20 minutes due to signal problem near Wonderland. Trains may stand by at stations.".to_owned();
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(body["summary"], "[Blue Line] Delay ~20 minutes");
     }
 
@@ -878,7 +690,7 @@ mod test {
             None,
         );
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(body["summary"], "[Green Line] Test header");
     }
 
@@ -892,7 +704,7 @@ mod test {
         );
         alert.attributes.header = "Due to severe weather, Subway, Bus, and Commuter Rail are operating on a reduced schedule. Ferry service is canceled.".to_owned();
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(
             body["summary"],
             "[MBTA] Due to severe weather, Subway, Bus, and Commuter Rail are operating on a reduced schedule"
@@ -909,7 +721,7 @@ mod test {
         );
         alert.attributes.header = "Red Line: Shuttle buses will replace service between Broadway and Ashmont this weekend.".to_owned();
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(
             body["summary"],
             "[Red Line] Shuttle between Broadway and Ashmont"
@@ -926,7 +738,7 @@ mod test {
         );
         alert.attributes.header = "Jackson Square: The stairway connecting the Jackson Sq lobby and the south end of the platform is closed until winter 2026. Use the stairway at the north end of the platform.".to_owned();
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(
             body["summary"],
             "[Orange Line] Jackson Square: The stairway connecting the Jackson Sq lobby and the south end of the platform is closed until winter 2026"
@@ -943,7 +755,7 @@ mod test {
         );
         alert.attributes.header = "Blue Line: Shuttle buses replacing service between Suffolk Downs and Maverick due to a power problem at Airport.".to_owned();
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(
             body["summary"],
             "[Blue Line] Shuttle between Suffolk Downs and Maverick"
@@ -960,7 +772,7 @@ mod test {
         );
         alert.attributes.header = "Red Line Ashmont Branch: Service between JFK/UMass and Ashmont will operate with two shuttle trains from April 10 - 30 to allow for critical track work.".to_owned();
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(
             body["summary"],
             "[Red Line] Service change between JFK/UMass and Ashmont"
@@ -1031,127 +843,6 @@ mod test {
         ));
     }
 
-    // --- event_summary without line prefix (per-line calendar) ---
-
-    #[test]
-    fn test_event_summary_no_prefix_delay_with_duration() {
-        let mut alert = make_alert(
-            "Red",
-            "DELAY",
-            Some("2026-02-23T05:49:00-05:00"),
-            Some("2026-02-23T13:47:00-05:00"),
-        );
-        alert.attributes.header = "Red Line Braintree Branch: Delays of about 20 minutes due to a signal problem at Braintree.".to_owned();
-        let summary = event_summary(&alert, LinePrefixMode::Omit);
-        let body = event_body(&alert, &summary, None);
-        assert_eq!(body["summary"], "Delay ~20 minutes");
-    }
-
-    #[test]
-    fn test_event_summary_no_prefix_shuttle_with_location() {
-        let mut alert = make_alert(
-            "Red",
-            "SHUTTLE",
-            Some("2024-06-01T09:00:00-04:00"),
-            Some("2024-06-01T23:00:00-04:00"),
-        );
-        alert.attributes.header = "Red Line: Shuttle buses will replace service between Broadway and Ashmont this weekend.".to_owned();
-        let summary = event_summary(&alert, LinePrefixMode::Omit);
-        let body = event_body(&alert, &summary, None);
-        assert_eq!(body["summary"], "Shuttle between Broadway and Ashmont");
-    }
-
-    #[test]
-    fn test_event_summary_no_prefix_first_sentence() {
-        let alert = make_alert(
-            "Red",
-            "DELAY",
-            Some("2024-06-01T09:00:00-04:00"),
-            Some("2024-06-01T23:00:00-04:00"),
-        );
-        let summary = event_summary(&alert, LinePrefixMode::Omit);
-        let body = event_body(&alert, &summary, None);
-        assert_eq!(body["summary"], "Test header");
-    }
-
-    // --- location_phrase ---
-
-    #[test]
-    fn test_location_phrase_between_truncates_at_this() {
-        assert_eq!(
-            location_phrase(
-                "Shuttle buses will replace service between Broadway and Ashmont this weekend."
-            ),
-            Some("between Broadway and Ashmont".to_string())
-        );
-    }
-
-    #[test]
-    fn test_location_phrase_between_truncates_at_comma() {
-        assert_eq!(
-            location_phrase(
-                "Shuttle buses will replace service between JFK/UMass and Braintree, the weekend of Mar 29 - 30."
-            ),
-            Some("between JFK/UMass and Braintree".to_string())
-        );
-    }
-
-    #[test]
-    fn test_location_phrase_between_truncates_at_will() {
-        assert_eq!(
-            location_phrase(
-                "Service between JFK/UMass and Ashmont will operate with two shuttle trains."
-            ),
-            Some("between JFK/UMass and Ashmont".to_string())
-        );
-    }
-
-    #[test]
-    fn test_location_phrase_from_through() {
-        assert_eq!(
-            location_phrase(
-                "Shuttle buses replace service from JFK/UMass through Ashmont (and Mattapan), April 1 - 9."
-            ),
-            Some("from JFK/UMass through Ashmont (and Mattapan)".to_string())
-        );
-    }
-
-    #[test]
-    fn test_location_phrase_between_truncates_at_from_date() {
-        assert_eq!(
-            location_phrase(
-                "Shuttle buses replace service between Back Bay and Forest Hills from February 28 - March 8 to allow for track work."
-            ),
-            Some("between Back Bay and Forest Hills".to_string())
-        );
-    }
-
-    #[test]
-    fn test_location_phrase_between_truncates_at_due() {
-        assert_eq!(
-            location_phrase(
-                "Shuttle buses replacing service between Suffolk Downs and Maverick due to a power problem at Airport."
-            ),
-            Some("between Suffolk Downs and Maverick".to_string())
-        );
-    }
-
-    #[test]
-    fn test_location_phrase_from_to_without_through_returns_none() {
-        assert_eq!(
-            location_phrase("Shuttle buses replace service from North Station to Anderson/Woburn."),
-            None
-        );
-    }
-
-    #[test]
-    fn test_location_phrase_none_when_no_pattern() {
-        assert_eq!(
-            location_phrase("Service will originate / terminate at the Lake Street platform."),
-            None
-        );
-    }
-
     // --- event_description ---
 
     #[test]
@@ -1200,111 +891,6 @@ mod test {
         );
     }
 
-    // --- effect_label ---
-
-    #[test]
-    fn test_effect_label_shuttle() {
-        assert_eq!(effect_label("SHUTTLE"), Some("Shuttle"));
-    }
-
-    #[test]
-    fn test_effect_label_service_change() {
-        assert_eq!(effect_label("SERVICE_CHANGE"), Some("Service change"));
-    }
-
-    #[test]
-    fn test_effect_label_delay() {
-        assert_eq!(effect_label("DELAY"), Some("Delay"));
-    }
-
-    #[test]
-    fn test_effect_label_unknown_returns_none() {
-        assert_eq!(effect_label("STATION_ISSUE"), None);
-        assert_eq!(effect_label("SOME_NEW_EFFECT"), None);
-    }
-
-    // --- first_sentence ---
-
-    #[test]
-    fn test_first_sentence_multi_sentence() {
-        assert_eq!(
-            first_sentence("The elevator is closed. Use the stairs. Thank you."),
-            "The elevator is closed"
-        );
-    }
-
-    #[test]
-    fn test_first_sentence_single_with_period() {
-        assert_eq!(
-            first_sentence("The elevator is closed."),
-            "The elevator is closed"
-        );
-    }
-
-    #[test]
-    fn test_first_sentence_no_period() {
-        assert_eq!(
-            first_sentence("The elevator is closed"),
-            "The elevator is closed"
-        );
-    }
-
-    #[test]
-    fn test_first_sentence_station_prefix() {
-        assert_eq!(
-            first_sentence(
-                "Jackson Square: The stairway is closed until winter 2026. Use the other stairway."
-            ),
-            "Jackson Square: The stairway is closed until winter 2026"
-        );
-    }
-
-    // --- uses_first_sentence_summary ---
-
-    #[test]
-    fn test_uses_first_sentence_delay_with_duration_is_false() {
-        let mut alert = make_alert("Red", "DELAY", None, None);
-        alert.attributes.header =
-            "Red Line: Delays of about 20 minutes due to a signal problem.".to_owned();
-        assert!(!uses_first_sentence_summary(&alert));
-    }
-
-    #[test]
-    fn test_uses_first_sentence_delay_without_duration_is_true() {
-        let alert = make_alert("Red", "DELAY", None, None);
-        assert!(uses_first_sentence_summary(&alert));
-    }
-
-    #[test]
-    fn test_uses_first_sentence_shuttle_with_location_is_false() {
-        let mut alert = make_alert("Red", "SHUTTLE", None, None);
-        alert.attributes.header =
-            "Red Line: Shuttle buses will replace service between Broadway and Ashmont this weekend."
-                .to_owned();
-        assert!(!uses_first_sentence_summary(&alert));
-    }
-
-    #[test]
-    fn test_uses_first_sentence_shuttle_without_location_is_true() {
-        let alert = make_alert("Red", "SHUTTLE", None, None);
-        assert!(uses_first_sentence_summary(&alert));
-    }
-
-    #[test]
-    fn test_uses_first_sentence_service_change_no_location_is_true() {
-        let mut alert = make_alert("Blue", "SERVICE_CHANGE", None, None);
-        alert.attributes.header =
-            "Subway, Bus, and Ferry have returned to regular schedules. Storm cleanup continues."
-                .to_owned();
-        assert!(uses_first_sentence_summary(&alert));
-    }
-
-    #[test]
-    fn test_uses_first_sentence_unmapped_effect_is_true() {
-        let alert = make_alert("Orange", "STATION_ISSUE", None, None);
-        assert!(uses_first_sentence_summary(&alert));
-    }
-
     // --- STATION_EFFECTS_TO_SKIP ---
 
     #[test]
@@ -1341,7 +927,7 @@ mod test {
             Some("2024-06-01T23:00:00-04:00"),
         );
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(body["description"], "Test header\n\nTest description");
     }
 
@@ -1354,7 +940,7 @@ mod test {
             Some("2024-06-01T23:00:00-04:00"),
         );
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(
             body["start"],
             json!({ "dateTime": "2024-06-01T09:00:00-04:00", "timeZone": "America/New_York" })
@@ -1369,7 +955,7 @@ mod test {
     fn test_event_body_dates_when_no_end() {
         let alert = make_alert("Red", "DELAY", Some("2024-06-01T09:00:00-04:00"), None);
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert_eq!(body["start"], json!({ "date": "2024-06-01" }));
         assert_eq!(body["end"], json!({ "date": "2024-06-02" }));
     }
@@ -1383,7 +969,7 @@ mod test {
             Some("2024-06-01T23:00:00-04:00"),
         );
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         let private = &body["extendedProperties"]["private"];
         assert_eq!(private["mbta_alert_source"], "true");
         assert_eq!(private["mbta_alert_id"], "alert-42");
@@ -1398,7 +984,7 @@ mod test {
             Some("2024-06-01T09:00:00-04:00"),
             Some("2024-06-01T23:00:00-04:00"),
         );
-        let body = event_body(&alert, "AI-generated title", Some("AI-generated title"));
+        let body = event_body(&alert, "AI-generated title", Some("AI-generated title")).unwrap();
         let private = &body["extendedProperties"]["private"];
         assert_eq!(private["mbta_alert_source"], "true");
         assert_eq!(private["mbta_alert_id"], "alert-42");
@@ -1409,7 +995,7 @@ mod test {
     fn test_event_body_no_period_falls_back_to_today() {
         let alert = make_alert_no_period("Orange", "SUSPENSION");
         let summary = event_summary(&alert, LinePrefixMode::Include);
-        let body = event_body(&alert, &summary, None);
+        let body = event_body(&alert, &summary, None).unwrap();
         assert!(body["start"].get("date").is_some());
         assert!(body["end"].get("date").is_some());
     }
@@ -1613,11 +1199,7 @@ mod test {
     #[test]
     fn test_plan_skip_when_hash_and_summary_match() {
         let alert = make_alert("Red", "DELAY", None, None);
-        let current_hash = event_state_hash(
-            &alert.attributes.header,
-            alert.period_start(),
-            alert.period_end(),
-        );
+        let current_hash = event_state_hash(&alert);
         let existing = make_existing(
             &alert.id,
             "event-1",
@@ -1654,11 +1236,7 @@ mod test {
     fn test_plan_update_when_ai_summary_missing() {
         // Event exists with matching hash but no AI summary — needs update to populate it.
         let alert = make_alert("Red", "DELAY", None, None);
-        let current_hash = event_state_hash(
-            &alert.attributes.header,
-            alert.period_start(),
-            alert.period_end(),
-        );
+        let current_hash = event_state_hash(&alert);
         let existing = make_existing(&alert.id, "event-1", None, Some(&current_hash));
 
         let plan = plan_calendar_sync(&existing, &[&alert]);
@@ -1699,11 +1277,7 @@ mod test {
         let mut alert_create = make_alert("Orange", "SHUTTLE", None, None);
         alert_create.id = "alert-create".to_owned();
 
-        let skip_hash = event_state_hash(
-            &alert_skip.attributes.header,
-            alert_skip.period_start(),
-            alert_skip.period_end(),
-        );
+        let skip_hash = event_state_hash(&alert_skip);
         let existing: HashMap<String, ExistingEvent> = [
             (
                 alert_skip.id.clone(),
