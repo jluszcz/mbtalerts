@@ -4,9 +4,9 @@ use jluszcz_rust_utils::{Verbosity, set_up_logger};
 use log::debug;
 use mbtalerts::APP_NAME;
 use mbtalerts::ai::BedrockSummarizer;
-use mbtalerts::calendar::{
-    CalendarClient, LinePrefixMode, first_sentence, generate_or_fallback, should_sync_alert,
-    sync_alerts, uses_first_sentence_summary,
+use mbtalerts::calendar::{CalendarClient, should_sync_alert, sync_alerts};
+use mbtalerts::summary::{
+    LinePrefixMode, first_sentence, generate_or_fallback, uses_first_sentence_summary,
 };
 use mbtalerts::types::Alerts;
 
@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
         let calendar = CalendarClient::from_env().await?;
         sync_alerts(&alerts, &calendar).await?;
     } else {
-        let summarizer = BedrockSummarizer::try_init().await;
+        let summarizer = BedrockSummarizer::from_env().await;
         print_alerts(&alerts, summarizer.as_ref()).await;
     }
 

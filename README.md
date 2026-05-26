@@ -2,7 +2,7 @@
 
 [![Build and Deploy](https://github.com/jluszcz/mbtalerts/actions/workflows/build-and-deploy.yml/badge.svg)](https://github.com/jluszcz/mbtalerts/actions/workflows/build-and-deploy.yml)
 
-Fetches active MBTA subway alerts (Red, Orange, and Green Lines) from the [MBTA v3 API](https://api-v3.mbta.com) and displays them in the terminal.
+Fetches active MBTA subway alerts (Red, Orange, Blue, and Green Lines) from the [MBTA v3 API](https://api-v3.mbta.com) and displays them in the terminal.
 
 ## Usage
 
