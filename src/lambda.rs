@@ -1,3 +1,4 @@
+use jluszcz_rust_utils::cache::CacheMode;
 use jluszcz_rust_utils::lambda;
 use lambda_runtime::{LambdaEvent, service_fn};
 use mbtalerts::APP_NAME;
@@ -14,7 +15,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
 }
 
 async fn handler(_event: LambdaEvent<Value>) -> Result<Value, lambda_runtime::Error> {
-    let alerts = mbtalerts::alerts(false).await?;
+    let alerts = mbtalerts::alerts(CacheMode::Disabled).await?;
 
     let calendar = CalendarClient::from_env().await?;
     sync_alerts(&alerts, &calendar).await?;

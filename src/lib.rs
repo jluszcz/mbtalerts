@@ -1,5 +1,5 @@
 use anyhow::Result;
-use jluszcz_rust_utils::cache::{dated_cache_path, try_cached_query};
+use jluszcz_rust_utils::cache::{CacheMode, dated_cache_path, try_cached_query};
 use log::{trace, warn};
 
 use crate::mbta::query_subway_alerts;
@@ -41,10 +41,10 @@ pub fn line_name(alert: &Alert) -> &str {
     "MBTA"
 }
 
-pub async fn alerts(use_cache: bool) -> Result<Alerts> {
+pub async fn alerts(cache_mode: CacheMode) -> Result<Alerts> {
     let cache_path = dated_cache_path("alerts");
 
-    let response = try_cached_query(use_cache, &cache_path, query_subway_alerts).await?;
+    let response = try_cached_query(cache_mode, &cache_path, query_subway_alerts).await?;
     trace!("{response}");
 
     let alerts: Alerts = serde_json::from_str(&response)?;
