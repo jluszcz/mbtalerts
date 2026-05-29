@@ -1,5 +1,6 @@
 use chrono::DateTime;
 use clap::{Arg, ArgAction, Command};
+use jluszcz_rust_utils::cache::CacheMode;
 use jluszcz_rust_utils::{Verbosity, set_up_logger};
 use log::debug;
 use mbtalerts::APP_NAME;
@@ -15,7 +16,7 @@ const SEPARATOR: &str = "----------------------------------------";
 #[derive(Debug)]
 struct Args {
     verbosity: Verbosity,
-    use_cache: bool,
+    cache_mode: CacheMode,
     sync_calendar: bool,
 }
 
@@ -47,12 +48,12 @@ fn parse_args() -> Args {
 
     let verbosity = matches.get_count("verbosity").into();
 
-    let use_cache = !matches.get_flag("no-cache");
+    let cache_mode = !matches.get_flag("no-cache");
     let sync_calendar = matches.get_flag("sync-calendar");
 
     Args {
         verbosity,
-        use_cache,
+        cache_mode: cache_mode.into(),
         sync_calendar,
     }
 }
@@ -118,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     set_up_logger(APP_NAME, module_path!(), args.verbosity)?;
     debug!("{args:?}");
 
-    let alerts = mbtalerts::alerts(args.use_cache).await?;
+    let alerts = mbtalerts::alerts(args.cache_mode).await?;
 
     if args.sync_calendar {
         let calendar = CalendarClient::from_env().await?;
