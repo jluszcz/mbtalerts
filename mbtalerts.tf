@@ -63,28 +63,6 @@ resource "aws_iam_role" "role" {
   assume_role_policy = data.aws_iam_policy_document.assume_role.json
 }
 
-data "aws_iam_policy_document" "cw" {
-  statement {
-    actions   = ["cloudwatch:PutMetricData"]
-    resources = ["*"]
-    condition {
-      test     = "StringEquals"
-      variable = "cloudwatch:namespace"
-      values   = ["mbtalerts"]
-    }
-  }
-}
-
-resource "aws_iam_policy" "cw" {
-  name   = "mbtalerts.cw"
-  policy = data.aws_iam_policy_document.cw.json
-}
-
-resource "aws_iam_role_policy_attachment" "cw" {
-  role       = aws_iam_role.role.name
-  policy_arn = aws_iam_policy.cw.arn
-}
-
 resource "aws_iam_role_policy_attachment" "basic_execution_role_attachment" {
   role       = aws_iam_role.role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
