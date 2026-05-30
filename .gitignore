@@ -1,5 +1,5 @@
-/target
-.idea/
-env
-.terraform*
 *zip
+.envrc
+.idea/
+.terraform*
+/target
