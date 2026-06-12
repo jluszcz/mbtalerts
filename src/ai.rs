@@ -62,7 +62,7 @@ impl BedrockSummarizer {
             .map(|s| strip_line_prefix(s.trim()).to_owned())
             .ok_or_else(|| anyhow!("Unexpected Bedrock response structure"))?;
 
-        debug!("Bedrock summary for {:?}: {:?}", header, text);
+        debug!("Bedrock summary for {header:?}: {text:?}");
         Ok(text)
     }
 }

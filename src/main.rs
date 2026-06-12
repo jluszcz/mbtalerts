@@ -3,13 +3,13 @@ use clap::{Arg, ArgAction, Command};
 use jluszcz_rust_utils::cache::CacheMode;
 use jluszcz_rust_utils::{Verbosity, set_up_logger};
 use log::debug;
-use mbtalerts::APP_NAME;
 use mbtalerts::ai::BedrockSummarizer;
-use mbtalerts::calendar::{CalendarClient, should_sync_alert, sync_alerts};
+use mbtalerts::calendar::{CalendarClient, sync_alerts};
 use mbtalerts::summary::{
     LinePrefixMode, first_sentence, generate_or_fallback, uses_first_sentence_summary,
 };
 use mbtalerts::types::Alerts;
+use mbtalerts::{APP_NAME, should_sync_alert};
 
 const SEPARATOR: &str = "----------------------------------------";
 
@@ -22,7 +22,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let matches = Command::new("mbtalerts")
-        .version("0.1")
+        .version(env!("CARGO_PKG_VERSION"))
         .author("Jacob Luszcz")
         .arg(
             Arg::new("verbosity")
@@ -72,7 +72,9 @@ async fn format_alert(
     let start = alert.period_start().map(format_dt);
     let end = alert.period_end().map(format_dt);
 
-    let (_, summary) = generate_or_fallback(summarizer, alert, LinePrefixMode::Include).await;
+    let summary = generate_or_fallback(summarizer, alert, LinePrefixMode::Include)
+        .await
+        .display;
 
     let formatted_summary = if let Some(close) = summary.find(']') {
         let (prefix, rest) = summary.split_at(close + 1);
@@ -135,25 +137,15 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use mbtalerts::types::{ActivePeriod, Alert, AlertAttributes, InformedEntity};
+    use mbtalerts::types::Alert;
 
     fn make_alert(route: &str, effect: &str, start: Option<&str>, end: Option<&str>) -> Alert {
-        Alert {
-            id: "test-id".to_owned(),
-            attributes: AlertAttributes {
-                header: "Service disruption in effect".to_owned(),
-                description: None,
-                url: None,
-                active_period: vec![ActivePeriod {
-                    start: start.map(str::to_owned),
-                    end: end.map(str::to_owned),
-                }],
-                effect: effect.to_owned(),
-                informed_entity: vec![InformedEntity {
-                    route: Some(route.to_owned()),
-                }],
-            },
-        }
+        Alert::builder()
+            .header("Service disruption in effect")
+            .route(route)
+            .effect(effect)
+            .period(start, end)
+            .build()
     }
 
     // --- format_dt ---
@@ -203,19 +195,11 @@ mod test {
 
     #[tokio::test]
     async fn test_format_alert_no_period_shows_no_dates() {
-        let alert = Alert {
-            id: "test-id".to_owned(),
-            attributes: AlertAttributes {
-                header: "Some header".to_owned(),
-                description: None,
-                url: None,
-                active_period: vec![],
-                effect: "SUSPENSION".to_owned(),
-                informed_entity: vec![InformedEntity {
-                    route: Some("Orange".to_owned()),
-                }],
-            },
-        };
+        let alert = Alert::builder()
+            .header("Some header")
+            .route("Orange")
+            .effect("SUSPENSION")
+            .build();
         let output = format_alert(&alert, None).await;
         assert!(output.contains("SUSPENSION"));
         assert!(output.contains("Orange Line"));

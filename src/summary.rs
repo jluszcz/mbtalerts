@@ -122,7 +122,7 @@ pub fn event_summary(alert: &Alert, line_prefix: LinePrefixMode) -> String {
     {
         return match line_prefix {
             LinePrefixMode::Include => format!("[{}] Delay {}", crate::line_name(alert), duration),
-            LinePrefixMode::Omit => format!("Delay {}", duration),
+            LinePrefixMode::Omit => format!("Delay {duration}"),
         };
     }
     if let Some(label) = effect_label(&alert.attributes.effect)
@@ -132,7 +132,7 @@ pub fn event_summary(alert: &Alert, line_prefix: LinePrefixMode) -> String {
             LinePrefixMode::Include => {
                 format!("[{}] {} {}", crate::line_name(alert), label, loc)
             }
-            LinePrefixMode::Omit => format!("{} {}", label, loc),
+            LinePrefixMode::Omit => format!("{label} {loc}"),
         };
     }
     match line_prefix {
@@ -156,44 +156,49 @@ pub fn uses_first_sentence_summary(alert: &Alert) -> bool {
     true
 }
 
+pub struct AlertSummary {
+    /// AI-generated summary without the line prefix, when Bedrock produced one.
+    pub raw: Option<String>,
+    /// Summary to display, with the line prefix applied per `LinePrefixMode`.
+    pub display: String,
+}
+
 pub async fn generate_or_fallback(
     summarizer: Option<&BedrockSummarizer>,
     alert: &Alert,
     line_prefix: LinePrefixMode,
-) -> (Option<String>, String) {
+) -> AlertSummary {
     if let Some(s) = summarizer {
         match s.generate_summary(&alert.attributes.header).await {
             Ok(raw) => {
                 let display = apply_line_prefix(&raw, alert, line_prefix);
-                return (Some(raw), display);
+                return AlertSummary {
+                    raw: Some(raw),
+                    display,
+                };
             }
             Err(e) => {
                 warn!("Bedrock inference failed for alert {}: {e:#}", alert.id);
             }
         }
     }
-    (None, event_summary(alert, line_prefix))
+    AlertSummary {
+        raw: None,
+        display: event_summary(alert, line_prefix),
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::types::{AlertAttributes, InformedEntity};
 
     fn make_alert(route: &str, effect: &str) -> Alert {
-        Alert {
-            id: "alert-42".to_owned(),
-            attributes: AlertAttributes {
-                header: "Test header".to_owned(),
-                description: Some("Test description".to_owned()),
-                url: None,
-                active_period: vec![],
-                effect: effect.to_owned(),
-                informed_entity: vec![InformedEntity {
-                    route: Some(route.to_owned()),
-                }],
-            },
-        }
+        Alert::builder()
+            .id("alert-42")
+            .description("Test description")
+            .route(route)
+            .effect(effect)
+            .build()
     }
 
     // --- effect_label ---
