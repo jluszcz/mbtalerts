@@ -7,11 +7,7 @@ const ROUTES: &str = "Red,Orange,Blue,Green-B,Green-C,Green-D,Green-E";
 
 pub async fn query_subway_alerts() -> anyhow::Result<String> {
     debug!("Fetching MBTA subway alerts");
-    let response = http_get(
-        &format!("{}/{}", API_URL, ALERTS),
-        &[("filter[route]", ROUTES)],
-    )
-    .await?;
+    let response = http_get(&format!("{API_URL}/{ALERTS}"), &[("filter[route]", ROUTES)]).await?;
     info!("Fetched MBTA subway alerts");
     Ok(response)
 }

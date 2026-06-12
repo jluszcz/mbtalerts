@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::ai::BedrockSummarizer;
 use crate::summary::{LinePrefixMode, generate_or_fallback};
 use crate::types::{Alert, Alerts};
+use crate::{Line, canonical_line, should_sync_alert};
 
 const CAL_API: &str = "https://www.googleapis.com/calendar/v3/calendars";
 const SCOPES: &[&str] = &["https://www.googleapis.com/auth/calendar.events"];
@@ -18,7 +19,7 @@ const SCOPES: &[&str] = &["https://www.googleapis.com/auth/calendar.events"];
 pub enum CalendarConfig {
     Single(String),
     PerLine {
-        map: HashMap<String, String>,
+        map: HashMap<Line, String>,
         default: String,
     },
 }
@@ -93,6 +94,26 @@ fn normalize_calendar_id(id: String) -> String {
     }
 }
 
+fn parse_calendar_ids(json_str: &str) -> Result<CalendarConfig> {
+    let raw: HashMap<String, String> =
+        serde_json::from_str(json_str).context("GOOGLE_CALENDAR_IDS is not valid JSON")?;
+    let default = raw
+        .get("default")
+        .cloned()
+        .map(normalize_calendar_id)
+        .context("GOOGLE_CALENDAR_IDS must include a \"default\" key")?;
+    let map = raw
+        .into_iter()
+        .filter(|(k, _)| k != "default")
+        .map(|(k, v)| {
+            let line = Line::from_name(&k)
+                .with_context(|| format!("Unknown line '{k}' in GOOGLE_CALENDAR_IDS"))?;
+            Ok((line, normalize_calendar_id(v)))
+        })
+        .collect::<Result<_>>()?;
+    Ok(CalendarConfig::PerLine { map, default })
+}
+
 impl CalendarClient {
     pub async fn from_env() -> Result<Self> {
         let key_json = std::env::var("GOOGLE_SERVICE_ACCOUNT_KEY")
@@ -101,19 +122,7 @@ impl CalendarClient {
             Arc::new(CustomServiceAccount::from_json(&key_json)?);
 
         let config = if let Ok(json_str) = std::env::var("GOOGLE_CALENDAR_IDS") {
-            let raw: HashMap<String, String> =
-                serde_json::from_str(&json_str).context("GOOGLE_CALENDAR_IDS is not valid JSON")?;
-            let default = raw
-                .get("default")
-                .cloned()
-                .map(normalize_calendar_id)
-                .context("GOOGLE_CALENDAR_IDS must include a \"default\" key")?;
-            let map = raw
-                .into_iter()
-                .filter(|(k, _)| k != "default")
-                .map(|(k, v)| (k, normalize_calendar_id(v)))
-                .collect();
-            CalendarConfig::PerLine { map, default }
+            parse_calendar_ids(&json_str)?
         } else {
             let id = std::env::var("GOOGLE_CALENDAR_ID")
                 .context("Either GOOGLE_CALENDAR_IDS or GOOGLE_CALENDAR_ID env var must be set")?;
@@ -145,7 +154,7 @@ impl CalendarClient {
         let mut events = Vec::new();
         let mut page_token: Option<String> = None;
         let time_min = chrono::Utc::now().to_rfc3339();
-        let events_url = format!("{}/{}/events", CAL_API, calendar_id);
+        let events_url = format!("{CAL_API}/{calendar_id}/events");
 
         debug!("Listing calendar events for {calendar_id}");
         loop {
@@ -178,7 +187,7 @@ impl CalendarClient {
         summary: &str,
         ai_summary_raw: Option<&str>,
     ) -> Result<()> {
-        let events_url = format!("{}/{}/events", CAL_API, calendar_id);
+        let events_url = format!("{CAL_API}/{calendar_id}/events");
         let body = event_body(alert, summary, ai_summary_raw)?;
         self.send_authenticated(self.client.post(&events_url).json(&body))
             .await?;
@@ -194,7 +203,7 @@ impl CalendarClient {
         summary: &str,
         ai_summary_raw: Option<&str>,
     ) -> Result<()> {
-        let event_url = format!("{}/{}/events/{}", CAL_API, calendar_id, event_id);
+        let event_url = format!("{CAL_API}/{calendar_id}/events/{event_id}");
         let body = event_body(alert, summary, ai_summary_raw)?;
         self.send_authenticated(self.client.put(&event_url).json(&body))
             .await?;
@@ -203,23 +212,12 @@ impl CalendarClient {
     }
 
     async fn delete_event(&self, calendar_id: &str, event_id: &str) -> Result<()> {
-        let event_url = format!("{}/{}/events/{}", CAL_API, calendar_id, event_id);
+        let event_url = format!("{CAL_API}/{calendar_id}/events/{event_id}");
         self.send_authenticated(self.client.delete(&event_url))
             .await?;
         info!("Deleted calendar event {event_id}");
         Ok(())
     }
-}
-
-const STATION_EFFECTS_TO_SKIP: &[&str] = &[
-    "STATION_ISSUE",
-    "STOP_CLOSURE",
-    "STATION_CLOSURE",
-    "PARKING_ISSUE",
-];
-
-pub fn should_sync_alert(alert: &Alert) -> bool {
-    !STATION_EFFECTS_TO_SKIP.contains(&alert.attributes.effect.as_str())
 }
 
 fn calendar_ids_for_alert<'a>(alert: &Alert, config: &'a CalendarConfig) -> Vec<&'a str> {
@@ -234,14 +232,15 @@ fn calendar_ids_for_alert<'a>(alert: &Alert, config: &'a CalendarConfig) -> Vec<
                     continue;
                 };
                 found_any_route = true;
-                match crate::canonical_line(route) {
+                match canonical_line(route) {
                     Some(line) => {
-                        if let Some(id) = map.get(line) {
+                        if let Some(id) = map.get(&line) {
                             ids.insert(id.as_str());
                         } else {
                             warn!(
                                 "Alert {}: line '{}' not in GOOGLE_CALENDAR_IDS, using default",
-                                alert.id, line
+                                alert.id,
+                                line.name()
                             );
                             ids.insert(default.as_str());
                         }
@@ -319,8 +318,8 @@ fn line_prefix_for_alert(
     };
     for entity in &alert.attributes.informed_entity {
         let Some(route) = &entity.route else { continue };
-        if let Some(line) = crate::canonical_line(route)
-            && map.get(line).map(String::as_str) == Some(calendar_id)
+        if let Some(line) = canonical_line(route)
+            && map.get(&line).map(String::as_str) == Some(calendar_id)
         {
             return LinePrefixMode::Omit;
         }
@@ -402,27 +401,20 @@ async fn sync_calendar(cal: &CalendarClient, calendar_id: &str, alerts: &[&Alert
 
     for alert in plan.to_create {
         let line_prefix = line_prefix_for_alert(alert, calendar_id, &cal.config);
-        let (ai_summary_raw, display_summary) =
-            generate_or_fallback(cal.summarizer.as_ref(), alert, line_prefix).await;
-        cal.create_event(
-            calendar_id,
-            alert,
-            &display_summary,
-            ai_summary_raw.as_deref(),
-        )
-        .await?;
+        let summary = generate_or_fallback(cal.summarizer.as_ref(), alert, line_prefix).await;
+        cal.create_event(calendar_id, alert, &summary.display, summary.raw.as_deref())
+            .await?;
     }
 
     for (event_id, alert) in &plan.to_update {
         let line_prefix = line_prefix_for_alert(alert, calendar_id, &cal.config);
-        let (ai_summary_raw, display_summary) =
-            generate_or_fallback(cal.summarizer.as_ref(), alert, line_prefix).await;
+        let summary = generate_or_fallback(cal.summarizer.as_ref(), alert, line_prefix).await;
         cal.update_event(
             calendar_id,
             event_id,
             alert,
-            &display_summary,
-            ai_summary_raw.as_deref(),
+            &summary.display,
+            summary.raw.as_deref(),
         )
         .await?;
     }
@@ -454,7 +446,12 @@ fn event_times(start: Option<&str>, end: Option<&str>) -> Result<(Value, Value)>
             Ok((json!({ "date": date }), json!({ "date": next_date(date)? })))
         }
         _ => {
-            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            // Alerts are Eastern-time events; using the UTC date would roll to
+            // tomorrow after ~7-8pm ET.
+            let today = chrono::Utc::now()
+                .with_timezone(&chrono_tz::America::New_York)
+                .format("%Y-%m-%d")
+                .to_string();
             let tomorrow = next_date(&today)?;
             Ok((json!({ "date": today }), json!({ "date": tomorrow })))
         }
@@ -530,41 +527,23 @@ fn event_body(alert: &Alert, summary: &str, ai_summary_raw: Option<&str>) -> Res
 mod test {
     use super::*;
     use crate::summary::event_summary;
-    use crate::types::{ActivePeriod, AlertAttributes, InformedEntity};
 
     fn make_alert(route: &str, effect: &str, start: Option<&str>, end: Option<&str>) -> Alert {
-        Alert {
-            id: "alert-42".to_owned(),
-            attributes: AlertAttributes {
-                header: "Test header".to_owned(),
-                description: Some("Test description".to_owned()),
-                url: None,
-                active_period: vec![ActivePeriod {
-                    start: start.map(str::to_owned),
-                    end: end.map(str::to_owned),
-                }],
-                effect: effect.to_owned(),
-                informed_entity: vec![InformedEntity {
-                    route: Some(route.to_owned()),
-                }],
-            },
-        }
+        Alert::builder()
+            .id("alert-42")
+            .description("Test description")
+            .route(route)
+            .effect(effect)
+            .period(start, end)
+            .build()
     }
 
     fn make_alert_no_period(route: &str, effect: &str) -> Alert {
-        Alert {
-            id: "alert-99".to_owned(),
-            attributes: AlertAttributes {
-                header: "Test header".to_owned(),
-                description: None,
-                url: None,
-                active_period: vec![],
-                effect: effect.to_owned(),
-                informed_entity: vec![InformedEntity {
-                    route: Some(route.to_owned()),
-                }],
-            },
-        }
+        Alert::builder()
+            .id("alert-99")
+            .route(route)
+            .effect(effect)
+            .build()
     }
 
     // --- next_date ---
@@ -802,17 +781,7 @@ mod test {
 
     #[test]
     fn test_line_prefix_fallback_no_route_includes() {
-        let alert = Alert {
-            id: "x".to_owned(),
-            attributes: AlertAttributes {
-                header: "Test".to_owned(),
-                description: None,
-                url: None,
-                active_period: vec![],
-                effect: "DELAY".to_owned(),
-                informed_entity: vec![InformedEntity { route: None }],
-            },
-        };
+        let alert = Alert::builder().id("x").header("Test").null_route().build();
         assert!(matches!(
             line_prefix_for_alert(&alert, "cal-default", &per_line_config()),
             LinePrefixMode::Include
@@ -824,7 +793,7 @@ mod test {
         // Line is identified as Red but Red has no calendar mapping
         let alert = make_alert("Red", "DELAY", None, None);
         let config = CalendarConfig::PerLine {
-            map: [("Orange".to_owned(), "cal-orange".to_owned())].into(),
+            map: [(Line::Orange, "cal-orange".to_owned())].into(),
             default: "cal-default".to_owned(),
         };
         assert!(matches!(
@@ -889,33 +858,6 @@ mod test {
             event_description(&alert),
             "Header with spaces\n\nDescription with spaces"
         );
-    }
-
-    // --- STATION_EFFECTS_TO_SKIP ---
-
-    #[test]
-    fn test_station_issue_is_skipped() {
-        assert!(STATION_EFFECTS_TO_SKIP.contains(&"STATION_ISSUE"));
-    }
-
-    #[test]
-    fn test_stop_closure_is_skipped() {
-        assert!(STATION_EFFECTS_TO_SKIP.contains(&"STOP_CLOSURE"));
-    }
-
-    #[test]
-    fn test_station_closure_is_skipped() {
-        assert!(STATION_EFFECTS_TO_SKIP.contains(&"STATION_CLOSURE"));
-    }
-
-    #[test]
-    fn test_parking_issue_is_skipped() {
-        assert!(STATION_EFFECTS_TO_SKIP.contains(&"PARKING_ISSUE"));
-    }
-
-    #[test]
-    fn test_shuttle_is_not_skipped() {
-        assert!(!STATION_EFFECTS_TO_SKIP.contains(&"SHUTTLE"));
     }
 
     #[test]
@@ -1016,15 +958,46 @@ mod test {
         );
     }
 
+    // --- parse_calendar_ids ---
+
+    #[test]
+    fn test_parse_calendar_ids_per_line() -> Result<()> {
+        let config = parse_calendar_ids(r#"{"default": "cal-default", "Red": "cal-red"}"#)?;
+        let CalendarConfig::PerLine { map, default } = config else {
+            panic!("expected PerLine config");
+        };
+        assert_eq!(default, "cal-default@group.calendar.google.com");
+        assert_eq!(
+            map.get(&Line::Red).map(String::as_str),
+            Some("cal-red@group.calendar.google.com")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_calendar_ids_missing_default_errors() {
+        assert!(parse_calendar_ids(r#"{"Red": "cal-red"}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_calendar_ids_unknown_line_errors() {
+        assert!(parse_calendar_ids(r#"{"default": "cal-default", "Gren": "cal-green"}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_calendar_ids_invalid_json_errors() {
+        assert!(parse_calendar_ids("not json").is_err());
+    }
+
     // --- calendar_ids_for_alert ---
 
     fn per_line_config() -> CalendarConfig {
         CalendarConfig::PerLine {
             map: [
-                ("Red".to_owned(), "cal-red".to_owned()),
-                ("Orange".to_owned(), "cal-orange".to_owned()),
-                ("Blue".to_owned(), "cal-blue".to_owned()),
-                ("Green".to_owned(), "cal-green".to_owned()),
+                (Line::Red, "cal-red".to_owned()),
+                (Line::Orange, "cal-orange".to_owned()),
+                (Line::Blue, "cal-blue".to_owned()),
+                (Line::Green, "cal-green".to_owned()),
             ]
             .into(),
             default: "cal-default".to_owned(),
@@ -1032,36 +1005,19 @@ mod test {
     }
 
     fn make_alert_multi_route(routes: &[&str], effect: &str) -> Alert {
-        Alert {
-            id: "alert-multi".to_owned(),
-            attributes: AlertAttributes {
-                header: "Test header".to_owned(),
-                description: None,
-                url: None,
-                active_period: vec![],
-                effect: effect.to_owned(),
-                informed_entity: routes
-                    .iter()
-                    .map(|r| InformedEntity {
-                        route: Some(r.to_string()),
-                    })
-                    .collect(),
-            },
+        let mut builder = Alert::builder().id("alert-multi").effect(effect);
+        for route in routes {
+            builder = builder.route(route);
         }
+        builder.build()
     }
 
     fn make_alert_no_route(effect: &str) -> Alert {
-        Alert {
-            id: "alert-no-route".to_owned(),
-            attributes: AlertAttributes {
-                header: "Test header".to_owned(),
-                description: None,
-                url: None,
-                active_period: vec![],
-                effect: effect.to_owned(),
-                informed_entity: vec![InformedEntity { route: None }],
-            },
-        }
+        Alert::builder()
+            .id("alert-no-route")
+            .effect(effect)
+            .null_route()
+            .build()
     }
 
     #[test]
@@ -1111,7 +1067,7 @@ mod test {
     #[test]
     fn test_calendar_ids_per_line_unmapped_line_returns_default() {
         let config = CalendarConfig::PerLine {
-            map: [("Red".to_owned(), "cal-red".to_owned())].into(),
+            map: [(Line::Red, "cal-red".to_owned())].into(),
             default: "cal-default".to_owned(),
         };
         let alert = make_alert("Blue", "DELAY", None, None);
@@ -1122,8 +1078,8 @@ mod test {
     fn test_calendar_ids_per_line_deduplicates_same_calendar() {
         let config = CalendarConfig::PerLine {
             map: [
-                ("Red".to_owned(), "cal-shared".to_owned()),
-                ("Orange".to_owned(), "cal-shared".to_owned()),
+                (Line::Red, "cal-shared".to_owned()),
+                (Line::Orange, "cal-shared".to_owned()),
             ]
             .into(),
             default: "cal-default".to_owned(),

@@ -13,25 +13,58 @@ pub mod types;
 
 pub const APP_NAME: &str = "mbtalerts";
 
-pub fn canonical_line(route: &str) -> Option<&'static str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Line {
+    Red,
+    Orange,
+    Blue,
+    Green,
+}
+
+impl Line {
+    pub const ALL: [Line; 4] = [Line::Red, Line::Orange, Line::Blue, Line::Green];
+
+    /// Canonical short name, used as the key in GOOGLE_CALENDAR_IDS.
+    pub fn name(self) -> &'static str {
+        match self {
+            Line::Red => "Red",
+            Line::Orange => "Orange",
+            Line::Blue => "Blue",
+            Line::Green => "Green",
+        }
+    }
+
+    /// Inverse of [`Line::name`]: parses a GOOGLE_CALENDAR_IDS key.
+    pub fn from_name(name: &str) -> Option<Line> {
+        Self::ALL.into_iter().find(|line| line.name() == name)
+    }
+
+    pub fn full_name(self) -> &'static str {
+        match self {
+            Line::Red => "Red Line",
+            Line::Orange => "Orange Line",
+            Line::Blue => "Blue Line",
+            Line::Green => "Green Line",
+        }
+    }
+}
+
+pub fn canonical_line(route: &str) -> Option<Line> {
     match route {
-        "Red" => Some("Red"),
-        "Orange" => Some("Orange"),
-        "Blue" => Some("Blue"),
-        r if r.starts_with("Green") => Some("Green"),
+        "Red" => Some(Line::Red),
+        "Orange" => Some(Line::Orange),
+        "Blue" => Some(Line::Blue),
+        r if r.starts_with("Green") => Some(Line::Green),
         _ => None,
     }
 }
 
-pub fn line_name(alert: &Alert) -> &str {
+pub fn line_name(alert: &Alert) -> &'static str {
     for entity in &alert.attributes.informed_entity {
         if let Some(route) = &entity.route {
             return match canonical_line(route) {
-                Some("Red") => "Red Line",
-                Some("Orange") => "Orange Line",
-                Some("Blue") => "Blue Line",
-                Some("Green") => "Green Line",
-                _ => {
+                Some(line) => line.full_name(),
+                None => {
                     warn!("Unknown route '{route}', falling back to MBTA");
                     "MBTA"
                 }
@@ -39,6 +72,19 @@ pub fn line_name(alert: &Alert) -> &str {
         }
     }
     "MBTA"
+}
+
+const STATION_EFFECTS_TO_SKIP: &[&str] = &[
+    "STATION_ISSUE",
+    "STOP_CLOSURE",
+    "STATION_CLOSURE",
+    "PARKING_ISSUE",
+];
+
+/// Station-level issues (closed stairways, parking, etc.) are noise for both
+/// the terminal output and calendar sync.
+pub fn should_sync_alert(alert: &Alert) -> bool {
+    !STATION_EFFECTS_TO_SKIP.contains(&alert.attributes.effect.as_str())
 }
 
 pub async fn alerts(cache_mode: CacheMode) -> Result<Alerts> {
@@ -59,85 +105,64 @@ mod test {
     const EXAMPLE_ALERTS_RESPONSE: &str = include_str!("../tests/fixtures/alerts.json");
 
     fn make_alert(route: &str) -> Alert {
-        Alert {
-            id: "test-id".to_owned(),
-            attributes: types::AlertAttributes {
-                header: "Test header".to_owned(),
-                description: None,
-                url: None,
-                active_period: vec![],
-                effect: "DELAY".to_owned(),
-                informed_entity: vec![types::InformedEntity {
-                    route: Some(route.to_owned()),
-                }],
-            },
-        }
+        Alert::builder().route(route).build()
     }
 
     fn make_alert_no_entities() -> Alert {
-        Alert {
-            id: "test-id".to_owned(),
-            attributes: types::AlertAttributes {
-                header: "Test header".to_owned(),
-                description: None,
-                url: None,
-                active_period: vec![],
-                effect: "DELAY".to_owned(),
-                informed_entity: vec![],
-            },
-        }
+        Alert::builder().build()
     }
 
     fn make_alert_null_route() -> Alert {
-        Alert {
-            id: "test-id".to_owned(),
-            attributes: types::AlertAttributes {
-                header: "Test header".to_owned(),
-                description: None,
-                url: None,
-                active_period: vec![],
-                effect: "DELAY".to_owned(),
-                informed_entity: vec![types::InformedEntity { route: None }],
-            },
-        }
+        Alert::builder().null_route().build()
     }
 
     #[test]
     fn test_deserialize() -> Result<()> {
-        let response: Result<Alerts, _> = serde_json::from_str(EXAMPLE_ALERTS_RESPONSE);
-        assert!(response.is_ok());
+        serde_json::from_str::<Alerts>(EXAMPLE_ALERTS_RESPONSE)?;
 
         Ok(())
     }
 
     #[test]
+    fn test_line_from_name_round_trips() {
+        for line in Line::ALL {
+            assert_eq!(Line::from_name(line.name()), Some(line));
+        }
+    }
+
+    #[test]
+    fn test_line_from_name_unknown() {
+        assert_eq!(Line::from_name("Silver"), None);
+    }
+
+    #[test]
     fn test_canonical_line_red() {
-        assert_eq!(canonical_line("Red"), Some("Red"));
+        assert_eq!(canonical_line("Red"), Some(Line::Red));
     }
 
     #[test]
     fn test_canonical_line_orange() {
-        assert_eq!(canonical_line("Orange"), Some("Orange"));
+        assert_eq!(canonical_line("Orange"), Some(Line::Orange));
     }
 
     #[test]
     fn test_canonical_line_blue() {
-        assert_eq!(canonical_line("Blue"), Some("Blue"));
+        assert_eq!(canonical_line("Blue"), Some(Line::Blue));
     }
 
     #[test]
     fn test_canonical_line_green() {
-        assert_eq!(canonical_line("Green"), Some("Green"));
+        assert_eq!(canonical_line("Green"), Some(Line::Green));
     }
 
     #[test]
     fn test_canonical_line_green_b() {
-        assert_eq!(canonical_line("Green-B"), Some("Green"));
+        assert_eq!(canonical_line("Green-B"), Some(Line::Green));
     }
 
     #[test]
     fn test_canonical_line_green_e() {
-        assert_eq!(canonical_line("Green-E"), Some("Green"));
+        assert_eq!(canonical_line("Green-E"), Some(Line::Green));
     }
 
     #[test]
@@ -198,5 +223,36 @@ mod test {
     #[test]
     fn test_line_name_null_route() {
         assert_eq!(line_name(&make_alert_null_route()), "MBTA");
+    }
+
+    fn make_alert_with_effect(effect: &str) -> Alert {
+        Alert::builder().route("Red").effect(effect).build()
+    }
+
+    #[test]
+    fn test_should_sync_station_issue_is_skipped() {
+        assert!(!should_sync_alert(&make_alert_with_effect("STATION_ISSUE")));
+    }
+
+    #[test]
+    fn test_should_sync_stop_closure_is_skipped() {
+        assert!(!should_sync_alert(&make_alert_with_effect("STOP_CLOSURE")));
+    }
+
+    #[test]
+    fn test_should_sync_station_closure_is_skipped() {
+        assert!(!should_sync_alert(&make_alert_with_effect(
+            "STATION_CLOSURE"
+        )));
+    }
+
+    #[test]
+    fn test_should_sync_parking_issue_is_skipped() {
+        assert!(!should_sync_alert(&make_alert_with_effect("PARKING_ISSUE")));
+    }
+
+    #[test]
+    fn test_should_sync_shuttle_is_synced() {
+        assert!(should_sync_alert(&make_alert_with_effect("SHUTTLE")));
     }
 }
