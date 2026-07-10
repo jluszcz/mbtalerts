@@ -84,14 +84,13 @@ const LOCATION_STOP_MARKERS: &[&str] = &[
 fn location_phrase(content: &str) -> Option<String> {
     let fragment = if let Some(idx) = content.find(" between ") {
         &content[idx + 1..]
-    } else if let Some(idx) = content.find(" from ") {
+    } else {
+        let idx = content.find(" from ")?;
         let candidate = &content[idx + 1..];
         if !candidate.contains(" through ") {
             return None;
         }
         candidate
-    } else {
-        return None;
     };
 
     let end = LOCATION_STOP_MARKERS
