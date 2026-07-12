@@ -19,7 +19,7 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-bedrockruntime = { version = "1", features = ["behavior-version-latest"] }
 chrono = "0"
 chrono-tz = "0"
-clap = "4"
+clap = { version = "4", features = ["derive"] }
 futures = "0"
 gcp_auth = "0"
 jluszcz_rust_utils = { git = "https://github.com/jluszcz/rust-utils", features = ["query"] }
