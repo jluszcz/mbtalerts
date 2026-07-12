@@ -1,5 +1,5 @@
 use chrono::DateTime;
-use clap::{Arg, ArgAction, Command};
+use clap::Parser;
 use jluszcz_rust_utils::cache::CacheMode;
 use jluszcz_rust_utils::{Verbosity, set_up_logger};
 use log::debug;
@@ -13,6 +13,22 @@ use mbtalerts::{APP_NAME, should_sync_alert};
 
 const SEPARATOR: &str = "----------------------------------------";
 
+#[derive(Debug, Parser)]
+#[command(version, author, infer_long_args = true)]
+struct RawArgs {
+    /// Increase verbosity (-v for debug, -vv for trace; max useful: -vv)
+    #[arg(short = 'v', action = clap::ArgAction::Count)]
+    verbosity: u8,
+
+    /// Query remote services instead of using cached values.
+    #[arg(short = 'n', long)]
+    no_cache: bool,
+
+    /// Sync alerts to Google Calendar (requires GOOGLE_SERVICE_ACCOUNT_KEY and either GOOGLE_CALENDAR_ID or GOOGLE_CALENDAR_IDS env vars).
+    #[arg(short = 's', long)]
+    sync_calendar: bool,
+}
+
 #[derive(Debug)]
 struct Args {
     verbosity: Verbosity,
@@ -21,41 +37,12 @@ struct Args {
 }
 
 fn parse_args() -> Args {
-    let matches = Command::new("mbtalerts")
-        .version(env!("CARGO_PKG_VERSION"))
-        .author("Jacob Luszcz")
-        .infer_long_args(true)
-        .arg(
-            Arg::new("verbosity")
-                .short('v')
-                .action(ArgAction::Count)
-                .help("Increase verbosity (-v for debug, -vv for trace; max useful: -vv)"),
-        )
-        .arg(
-            Arg::new("no-cache")
-                .short('n')
-                .long("no-cache")
-                .action(ArgAction::SetTrue)
-                .help("Query remote services instead of using cached values."),
-        )
-        .arg(
-            Arg::new("sync-calendar")
-                .short('s')
-                .long("sync-calendar")
-                .action(ArgAction::SetTrue)
-                .help("Sync alerts to Google Calendar (requires GOOGLE_SERVICE_ACCOUNT_KEY and either GOOGLE_CALENDAR_ID or GOOGLE_CALENDAR_IDS env vars)."),
-        )
-        .get_matches();
-
-    let verbosity = matches.get_count("verbosity").into();
-
-    let cache_mode = !matches.get_flag("no-cache");
-    let sync_calendar = matches.get_flag("sync-calendar");
+    let raw = RawArgs::parse();
 
     Args {
-        verbosity,
-        cache_mode: cache_mode.into(),
-        sync_calendar,
+        verbosity: raw.verbosity.into(),
+        cache_mode: (!raw.no_cache).into(),
+        sync_calendar: raw.sync_calendar,
     }
 }
 
