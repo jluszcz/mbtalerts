@@ -123,6 +123,57 @@ mod test {
         Ok(())
     }
 
+    /// Runs the summarizer over every alert in the captured API response.
+    ///
+    /// Summary extraction is highly sensitive to real header shapes, which the
+    /// hand-written fixtures elsewhere in the suite cannot cover. These are
+    /// properties every title must hold rather than exact strings, so the test
+    /// does not need updating when the fixture is refreshed.
+    #[test]
+    fn test_event_summary_over_captured_alerts() -> Result<()> {
+        use crate::summary::{LinePrefixMode, event_summary};
+
+        let alerts: Alerts = serde_json::from_str(EXAMPLE_ALERTS_RESPONSE)?;
+        let mut checked = 0;
+
+        for alert in alerts.data.iter().filter(|a| should_sync_alert(a)) {
+            let with_prefix = event_summary(alert, LinePrefixMode::Include);
+            let without_prefix = event_summary(alert, LinePrefixMode::Omit);
+
+            for summary in [&with_prefix, &without_prefix] {
+                assert!(!summary.is_empty(), "empty summary for alert {}", alert.id);
+                assert_eq!(summary.trim(), summary, "untrimmed summary: {summary:?}");
+                // Calendar event titles are single-line.
+                assert!(!summary.contains('\n'), "multi-line summary: {summary:?}");
+                // The line prefix is either applied by us or stripped, never left
+                // embedded in the middle of the title.
+                assert!(
+                    !summary.contains("Line: "),
+                    "line prefix survived stripping: {summary:?}"
+                );
+            }
+
+            assert!(
+                with_prefix.starts_with('['),
+                "Include mode must apply the line prefix: {with_prefix:?}"
+            );
+            assert!(
+                !without_prefix.starts_with('['),
+                "Omit mode must not apply the line prefix: {without_prefix:?}"
+            );
+            // A title is extracted from the header, never invented beyond it.
+            assert!(
+                without_prefix.len() <= alert.attributes.header.trim().len(),
+                "summary is longer than the header it came from: {without_prefix:?}"
+            );
+
+            checked += 1;
+        }
+
+        assert!(checked > 0, "fixture produced no syncable alerts");
+        Ok(())
+    }
+
     #[test]
     fn test_line_from_name_round_trips() {
         for line in Line::ALL {
