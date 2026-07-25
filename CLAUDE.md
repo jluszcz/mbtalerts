@@ -47,9 +47,13 @@ Events are identified and diffed purely through Google `extendedProperties.priva
 **Renaming any of these orphans every existing event**, and the next sync deletes and recreates the entire calendar.
 
 `event_state_hash` must cover everything the rendered event depends on — currently header, description, url, active
-period bounds, effect, and the sorted routes. Adding a field to the title or the routing means adding it to the hash;
-otherwise that change never re-syncs. Widening the hash invalidates every stored hash, so the first sync afterwards
-rewrites every event once.
+period bounds, effect, and routes. Adding a field to the title or the routing means adding it to the hash; otherwise
+that change never re-syncs. Widening the hash invalidates every stored hash, so the first sync afterwards rewrites
+every event once.
+
+Routes feed the hash in `informed_entity` order, not sorted, because `line_name` (`src/lib.rs`) renders the **first**
+entity's route — so a reorder really does change the title. Err toward over-syncing here: a needless rewrite is
+cheap, a permanently stale title is not.
 
 `mbta_alert_state_hash` is always written, even with no AI summary. `plan_calendar_sync` takes an `AiSummaries` flag so
 it only demands an `mbta_ai_summary` when a summarizer actually exists — otherwise an uncredentialed run rewrites every

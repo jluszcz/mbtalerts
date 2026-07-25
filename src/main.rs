@@ -76,11 +76,12 @@ async fn format_alert(alert: &Alert, summarizer: Option<&BedrockSummarizer>) -> 
 
     let summary = generate_or_fallback(summarizer, alert, LinePrefixMode::Include).await;
 
+    let ai_generated_title = summary.raw.is_some();
     let formatted_summary = if let Some(close) = summary.display.find(']') {
         let (prefix, rest) = summary.display.split_at(close + 1);
         format!("\x1b[1m{prefix}\x1b[22m{rest}")
     } else {
-        summary.display.clone()
+        summary.display
     };
 
     let date_part = match (start, end) {
@@ -89,7 +90,7 @@ async fn format_alert(alert: &Alert, summarizer: Option<&BedrockSummarizer>) -> 
         _ => String::new(),
     };
 
-    let body = alert_body(alert, summary.raw.is_some());
+    let body = alert_body(alert, ai_generated_title);
 
     format!("{formatted_summary}{date_part}\n{effect} {body}")
 }

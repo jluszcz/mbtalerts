@@ -528,8 +528,11 @@ fn event_description(alert: &Alert) -> String {
 /// Effect and routes are in here because the event *title* renders both (via
 /// `effect_label` and `line_name`) and the routes also decide which calendar
 /// the alert lands on — an alert can change either without its header moving.
-/// Routes are sorted and deduplicated so a reordered `informed_entity` list
-/// does not read as a change.
+///
+/// Routes are fed in `informed_entity` order rather than sorted, because
+/// `line_name` renders the *first* entity's route: a reorder changes the title,
+/// so the hash has to see it. Normalizing here would trade a rare, harmless
+/// rewrite for a permanently stale line name.
 fn event_state_hash(alert: &Alert) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     let feed = |hash: &mut u64, s: &str| {
@@ -551,15 +554,12 @@ fn event_state_hash(alert: &Alert) -> String {
     feed(&mut hash, alert.period_end().unwrap_or(""));
     feed(&mut hash, &alert.attributes.effect);
 
-    let mut routes: Vec<&str> = alert
+    for route in alert
         .attributes
         .informed_entity
         .iter()
         .filter_map(|entity| entity.route.as_deref())
-        .collect();
-    routes.sort_unstable();
-    routes.dedup();
-    for route in routes {
+    {
         feed(&mut hash, route);
     }
 
@@ -1274,12 +1274,19 @@ mod test {
     }
 
     #[test]
-    fn test_event_state_hash_ignores_route_order() {
-        // The API is free to reorder informed entities; that must not look like
-        // a change and trigger a pointless rewrite.
-        let a = Alert::builder().route("Red").route("Blue").build();
-        let b = Alert::builder().route("Blue").route("Red").build();
-        assert_eq!(event_state_hash(&a), event_state_hash(&b));
+    fn test_event_state_hash_follows_route_order() {
+        // line_name renders the *first* informed entity's route, so the order is
+        // semantic: reordering the entities changes the rendered title, and the
+        // hash has to see that or the event keeps a stale line name forever.
+        let red_first = Alert::builder().route("Red").route("Blue").build();
+        let blue_first = Alert::builder().route("Blue").route("Red").build();
+
+        assert_ne!(crate::line_name(&red_first), crate::line_name(&blue_first));
+        assert_ne!(
+            event_state_hash(&red_first),
+            event_state_hash(&blue_first),
+            "a title-changing reorder must not hash the same"
+        );
     }
 
     #[test]
