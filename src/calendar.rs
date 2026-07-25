@@ -150,7 +150,6 @@ impl CalendarClient {
     }
 
     async fn list_alert_events(&self, calendar_id: &str) -> Result<Vec<CalendarEvent>> {
-        let token = self.access_token().await?;
         let mut events = Vec::new();
         let mut page_token: Option<String> = None;
         let time_min = chrono::Utc::now().to_rfc3339();
@@ -158,6 +157,9 @@ impl CalendarClient {
 
         debug!("Listing calendar events for {calendar_id}");
         loop {
+            // Refreshed per page, like send_authenticated: a long pagination can
+            // outlive a token fetched once before the loop.
+            let token = self.access_token().await?;
             let mut req = self.client.get(&events_url).bearer_auth(&token).query(&[
                 ("privateExtendedProperty", "mbta_alert_source=true"),
                 ("timeMin", &time_min),
@@ -268,6 +270,21 @@ fn calendar_ids_for_alert<'a>(alert: &Alert, config: &'a CalendarConfig) -> Vec<
     }
 }
 
+/// Resolves each alert's target calendars once, keyed by alert id.
+///
+/// Doing this per (alert, calendar) pair instead re-runs the route lookup — and
+/// re-fires its "unknown route" / "no route information" warnings — once for
+/// every configured calendar.
+fn calendar_ids_by_alert<'a, 'c>(
+    alerts: &[&'a Alert],
+    config: &'c CalendarConfig,
+) -> HashMap<&'a str, Vec<&'c str>> {
+    alerts
+        .iter()
+        .map(|alert| (alert.id.as_str(), calendar_ids_for_alert(alert, config)))
+        .collect()
+}
+
 pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
     let calendar_ids: HashSet<&str> = match &cal.config {
         CalendarConfig::Single(id) => std::iter::once(id.as_str()).collect(),
@@ -294,11 +311,17 @@ pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
         })
         .collect();
 
+    let ids_by_alert = calendar_ids_by_alert(&sync_alerts, &cal.config);
+
     let tasks = calendar_ids.into_iter().map(|calendar_id| {
         let cal_alerts: Vec<&Alert> = sync_alerts
             .iter()
             .copied()
-            .filter(|a| calendar_ids_for_alert(a, &cal.config).contains(&calendar_id))
+            .filter(|a| {
+                ids_by_alert
+                    .get(a.id.as_str())
+                    .is_some_and(|ids| ids.contains(&calendar_id))
+            })
             .collect();
         async move { sync_calendar(cal, calendar_id, &cal_alerts).await }
     });
@@ -333,6 +356,22 @@ struct ExistingEvent {
     state_hash: Option<String>,
 }
 
+/// Whether a Bedrock summarizer is configured for this run.
+///
+/// Without one, no sync will ever populate `mbta_ai_summary`, so requiring it
+/// before skipping an unchanged event rewrites every event on every run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiSummaries {
+    Enabled,
+    Disabled,
+}
+
+impl AiSummaries {
+    fn required(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
 struct SyncPlan<'a> {
     to_create: Vec<&'a Alert>,
     to_update: Vec<(String, &'a Alert)>, // (event_id, alert)
@@ -342,6 +381,7 @@ struct SyncPlan<'a> {
 fn plan_calendar_sync<'a>(
     existing_by_alert_id: &HashMap<String, ExistingEvent>,
     alerts: &[&'a Alert],
+    ai_summaries: AiSummaries,
 ) -> SyncPlan<'a> {
     let mut to_create = Vec::new();
     let mut to_update = Vec::new();
@@ -351,11 +391,13 @@ fn plan_calendar_sync<'a>(
         let current_hash = event_state_hash(alert);
         match existing_by_alert_id.get(&alert.id) {
             Some(ExistingEvent {
-                ai_summary: Some(_),
+                ai_summary,
                 state_hash: Some(cached_hash),
                 ..
-            }) if *cached_hash == current_hash => {
-                // Event exists and summary is already up-to-date; no write needed.
+            }) if *cached_hash == current_hash
+                && (!ai_summaries.required() || ai_summary.is_some()) =>
+            {
+                // Event exists and is already up-to-date; no write needed.
             }
             Some(ExistingEvent { event_id, .. }) => {
                 to_update.push((event_id.clone(), *alert));
@@ -397,7 +439,13 @@ async fn sync_calendar(cal: &CalendarClient, calendar_id: &str, alerts: &[&Alert
         }
     }
 
-    let plan = plan_calendar_sync(&existing_by_alert_id, alerts);
+    let ai_summaries = if cal.summarizer.is_some() {
+        AiSummaries::Enabled
+    } else {
+        AiSummaries::Disabled
+    };
+
+    let plan = plan_calendar_sync(&existing_by_alert_id, alerts, ai_summaries);
 
     for alert in plan.to_create {
         let line_prefix = line_prefix_for_alert(alert, calendar_id, &cal.config);
@@ -473,8 +521,18 @@ fn event_description(alert: &Alert) -> String {
     parts.join("\n\n")
 }
 
-/// FNV-1a 64-bit hash over header, description, url, and active period bounds —
-/// deterministic across platforms and Rust versions.
+/// FNV-1a 64-bit hash over everything the rendered event depends on: header,
+/// description, url, active period bounds, effect, and routes. Deterministic
+/// across platforms and Rust versions.
+///
+/// Effect and routes are in here because the event *title* renders both (via
+/// `effect_label` and `line_name`) and the routes also decide which calendar
+/// the alert lands on — an alert can change either without its header moving.
+///
+/// Routes are fed in `informed_entity` order rather than sorted, because
+/// `line_name` renders the *first* entity's route: a reorder changes the title,
+/// so the hash has to see it. Normalizing here would trade a rare, harmless
+/// rewrite for a permanently stale line name.
 fn event_state_hash(alert: &Alert) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     let feed = |hash: &mut u64, s: &str| {
@@ -494,6 +552,17 @@ fn event_state_hash(alert: &Alert) -> String {
     feed(&mut hash, alert.attributes.url.as_deref().unwrap_or(""));
     feed(&mut hash, alert.period_start().unwrap_or(""));
     feed(&mut hash, alert.period_end().unwrap_or(""));
+    feed(&mut hash, &alert.attributes.effect);
+
+    for route in alert
+        .attributes
+        .informed_entity
+        .iter()
+        .filter_map(|entity| entity.route.as_deref())
+    {
+        feed(&mut hash, route);
+    }
+
     hash.to_string()
 }
 
@@ -503,12 +572,14 @@ fn event_body(alert: &Alert, summary: &str, ai_summary_raw: Option<&str>) -> Res
     let mut private = serde_json::Map::new();
     private.insert("mbta_alert_source".to_owned(), json!("true"));
     private.insert("mbta_alert_id".to_owned(), json!(alert.id));
+    // Always recorded: without it the next sync has nothing to compare against
+    // and rewrites the event unconditionally.
+    private.insert(
+        "mbta_alert_state_hash".to_owned(),
+        json!(event_state_hash(alert)),
+    );
     if let Some(raw) = ai_summary_raw {
         private.insert("mbta_ai_summary".to_owned(), json!(raw));
-        private.insert(
-            "mbta_alert_state_hash".to_owned(),
-            json!(event_state_hash(alert)),
-        );
     }
 
     Ok(json!({
@@ -1065,6 +1136,29 @@ mod test {
     }
 
     #[test]
+    fn test_calendar_ids_by_alert_resolves_each_alert_once() {
+        // Routing is resolved per alert, not per (alert, calendar) pair — the
+        // per-calendar form re-ran the route lookup and re-fired its warnings
+        // once for every configured calendar.
+        let config = per_line_config();
+        let red = make_alert("Red", "DELAY", None, None);
+        let mut multi = make_alert_multi_route(&["Blue", "Orange"], "SHUTTLE");
+        multi.id = "alert-multi".to_owned();
+        let mut routeless = make_alert_no_route("DELAY");
+        routeless.id = "alert-routeless".to_owned();
+
+        let by_alert = calendar_ids_by_alert(&[&red, &multi, &routeless], &config);
+
+        assert_eq!(by_alert.len(), 3);
+        assert_eq!(by_alert[red.id.as_str()], vec!["cal-red"]);
+        assert_eq!(by_alert[routeless.id.as_str()], vec!["cal-default"]);
+
+        let mut multi_ids = by_alert[multi.id.as_str()].clone();
+        multi_ids.sort();
+        assert_eq!(multi_ids, vec!["cal-blue", "cal-orange"]);
+    }
+
+    #[test]
     fn test_calendar_ids_per_line_unmapped_line_returns_default() {
         let config = CalendarConfig::PerLine {
             map: [(Line::Red, "cal-red".to_owned())].into(),
@@ -1152,6 +1246,49 @@ mod test {
         .into()
     }
 
+    // --- event_state_hash ---
+
+    #[test]
+    fn test_event_state_hash_is_stable_for_identical_alerts() {
+        let a = make_alert("Red", "DELAY", None, None);
+        let b = make_alert("Red", "DELAY", None, None);
+        assert_eq!(event_state_hash(&a), event_state_hash(&b));
+    }
+
+    #[test]
+    fn test_event_state_hash_changes_with_effect() {
+        // The title renders the effect, so a DELAY -> SUSPENSION flip with an
+        // unchanged header must still re-sync the event.
+        let delay = make_alert("Red", "DELAY", None, None);
+        let suspension = make_alert("Red", "SUSPENSION", None, None);
+        assert_ne!(event_state_hash(&delay), event_state_hash(&suspension));
+    }
+
+    #[test]
+    fn test_event_state_hash_changes_with_route() {
+        // The title renders the line name, and the route decides which calendar
+        // the alert belongs to.
+        let red = make_alert("Red", "DELAY", None, None);
+        let blue = make_alert("Blue", "DELAY", None, None);
+        assert_ne!(event_state_hash(&red), event_state_hash(&blue));
+    }
+
+    #[test]
+    fn test_event_state_hash_follows_route_order() {
+        // line_name renders the *first* informed entity's route, so the order is
+        // semantic: reordering the entities changes the rendered title, and the
+        // hash has to see that or the event keeps a stale line name forever.
+        let red_first = Alert::builder().route("Red").route("Blue").build();
+        let blue_first = Alert::builder().route("Blue").route("Red").build();
+
+        assert_ne!(crate::line_name(&red_first), crate::line_name(&blue_first));
+        assert_ne!(
+            event_state_hash(&red_first),
+            event_state_hash(&blue_first),
+            "a title-changing reorder must not hash the same"
+        );
+    }
+
     #[test]
     fn test_plan_skip_when_hash_and_summary_match() {
         let alert = make_alert("Red", "DELAY", None, None);
@@ -1163,7 +1300,7 @@ mod test {
             Some(&current_hash),
         );
 
-        let plan = plan_calendar_sync(&existing, &[&alert]);
+        let plan = plan_calendar_sync(&existing, &[&alert], AiSummaries::Enabled);
 
         assert!(plan.to_create.is_empty(), "no creates expected");
         assert!(plan.to_update.is_empty(), "no updates expected");
@@ -1180,7 +1317,7 @@ mod test {
             Some("stale-hash"),
         );
 
-        let plan = plan_calendar_sync(&existing, &[&alert]);
+        let plan = plan_calendar_sync(&existing, &[&alert], AiSummaries::Enabled);
 
         assert!(plan.to_create.is_empty());
         assert_eq!(plan.to_update.len(), 1);
@@ -1189,16 +1326,55 @@ mod test {
     }
 
     #[test]
-    fn test_plan_update_when_ai_summary_missing() {
-        // Event exists with matching hash but no AI summary — needs update to populate it.
+    fn test_plan_update_when_ai_summary_missing_and_ai_is_configured() {
+        // A summarizer is available but the event has no AI summary yet, so it
+        // needs one write to populate it.
         let alert = make_alert("Red", "DELAY", None, None);
         let current_hash = event_state_hash(&alert);
         let existing = make_existing(&alert.id, "event-1", None, Some(&current_hash));
 
-        let plan = plan_calendar_sync(&existing, &[&alert]);
+        let plan = plan_calendar_sync(&existing, &[&alert], AiSummaries::Enabled);
 
         assert!(plan.to_create.is_empty());
         assert_eq!(plan.to_update.len(), 1);
+    }
+
+    #[test]
+    fn test_plan_skip_without_ai_when_hash_matches() {
+        // With no summarizer configured, no run will ever produce an AI summary.
+        // Demanding one rewrites every event on every sync, forever.
+        let alert = make_alert("Red", "DELAY", None, None);
+        let current_hash = event_state_hash(&alert);
+        let existing = make_existing(&alert.id, "event-1", None, Some(&current_hash));
+
+        let plan = plan_calendar_sync(&existing, &[&alert], AiSummaries::Disabled);
+
+        assert!(plan.to_create.is_empty());
+        assert!(plan.to_update.is_empty(), "no rewrite expected");
+        assert!(plan.to_delete.is_empty());
+    }
+
+    #[test]
+    fn test_plan_update_without_ai_when_hash_differs() {
+        let alert = make_alert("Red", "DELAY", None, None);
+        let existing = make_existing(&alert.id, "event-1", None, Some("stale-hash"));
+
+        let plan = plan_calendar_sync(&existing, &[&alert], AiSummaries::Disabled);
+
+        assert_eq!(plan.to_update.len(), 1);
+    }
+
+    #[test]
+    fn test_event_body_always_writes_the_state_hash() {
+        // Without the hash there is nothing for the next sync to compare against,
+        // so every event lands in to_update on every run.
+        let alert = make_alert("Red", "DELAY", None, None);
+
+        let body = event_body(&alert, "Some summary", None).unwrap();
+        let private = &body["extendedProperties"]["private"];
+
+        assert_eq!(private["mbta_alert_state_hash"], event_state_hash(&alert));
+        assert!(private.get("mbta_ai_summary").is_none());
     }
 
     #[test]
@@ -1206,7 +1382,7 @@ mod test {
         let alert = make_alert("Red", "DELAY", None, None);
         let existing = HashMap::new();
 
-        let plan = plan_calendar_sync(&existing, &[&alert]);
+        let plan = plan_calendar_sync(&existing, &[&alert], AiSummaries::Enabled);
 
         assert_eq!(plan.to_create.len(), 1);
         assert!(plan.to_update.is_empty());
@@ -1217,7 +1393,7 @@ mod test {
     fn test_plan_delete_stale_event() {
         let existing = make_existing("stale-alert", "event-99", Some("summary"), Some("hash"));
 
-        let plan = plan_calendar_sync(&existing, &[]);
+        let plan = plan_calendar_sync(&existing, &[], AiSummaries::Enabled);
 
         assert!(plan.to_create.is_empty());
         assert!(plan.to_update.is_empty());
@@ -1262,7 +1438,11 @@ mod test {
         ]
         .into();
 
-        let plan = plan_calendar_sync(&existing, &[&alert_skip, &alert_update, &alert_create]);
+        let plan = plan_calendar_sync(
+            &existing,
+            &[&alert_skip, &alert_update, &alert_create],
+            AiSummaries::Enabled,
+        );
 
         assert_eq!(plan.to_create.len(), 1);
         assert_eq!(plan.to_create[0].id, "alert-create");
