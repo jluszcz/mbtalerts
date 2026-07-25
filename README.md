@@ -10,13 +10,18 @@ Fetches active MBTA subway alerts (Red, Orange, Blue, and Green Lines) from the 
 cargo run
 ```
 
-Alerts are printed to stdout in the format:
+Each alert is printed as a separator line, then a title line — `[Line] Summary - (start - end)`, with the line name
+in bold — then the effect and the alert body:
 
 ```
 ----------------------------------------
-EFFECT  Line  Start  End
-Header text
+[Red Line] Delay ~20 minutes - (6/1/2024 9:00am - 6/1/2024 11:00pm)
+DELAY Red Line: Delays of about 20 minutes due to a signal problem at Broadway. Shuttle buses are not available.
 ```
+
+The date range is omitted for alerts with no active period. When the title is derived from the header's first
+sentence, that sentence is dropped from the body to avoid printing it twice; when the title comes from Bedrock the
+whole header is shown, since an AI title is not a substring of it.
 
 ### Options
 

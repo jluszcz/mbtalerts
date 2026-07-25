@@ -8,7 +8,7 @@ use mbtalerts::calendar::{CalendarClient, sync_alerts};
 use mbtalerts::summary::{
     LinePrefixMode, first_sentence, generate_or_fallback, uses_first_sentence_summary,
 };
-use mbtalerts::types::Alerts;
+use mbtalerts::types::{Alert, Alerts};
 use mbtalerts::{APP_NAME, should_sync_alert};
 
 const SEPARATOR: &str = "----------------------------------------";
@@ -52,23 +52,35 @@ fn format_dt(s: &str) -> String {
         .unwrap_or_else(|_| s.to_owned())
 }
 
-async fn format_alert(
-    alert: &mbtalerts::types::Alert,
-    summarizer: Option<&BedrockSummarizer>,
-) -> String {
+/// The body to print beneath the title.
+///
+/// The header's first sentence is dropped only when it *is* the title. An
+/// AI-generated title is unrelated to that sentence, so stripping it there would
+/// delete content that appears nowhere else in the output.
+fn alert_body(alert: &Alert, ai_generated_title: bool) -> &str {
+    let header = &alert.attributes.header;
+
+    if ai_generated_title || !uses_first_sentence_summary(alert) {
+        return header;
+    }
+
+    let first = first_sentence(header);
+    let rest = header[first.len()..].trim_start_matches(['.', ' ']);
+    if rest.is_empty() { header } else { rest }
+}
+
+async fn format_alert(alert: &Alert, summarizer: Option<&BedrockSummarizer>) -> String {
     let effect = &alert.attributes.effect;
     let start = alert.period_start().map(format_dt);
     let end = alert.period_end().map(format_dt);
 
-    let summary = generate_or_fallback(summarizer, alert, LinePrefixMode::Include)
-        .await
-        .display;
+    let summary = generate_or_fallback(summarizer, alert, LinePrefixMode::Include).await;
 
-    let formatted_summary = if let Some(close) = summary.find(']') {
-        let (prefix, rest) = summary.split_at(close + 1);
+    let formatted_summary = if let Some(close) = summary.display.find(']') {
+        let (prefix, rest) = summary.display.split_at(close + 1);
         format!("\x1b[1m{prefix}\x1b[22m{rest}")
     } else {
-        summary
+        summary.display.clone()
     };
 
     let date_part = match (start, end) {
@@ -77,14 +89,7 @@ async fn format_alert(
         _ => String::new(),
     };
 
-    let header = &alert.attributes.header;
-    let body: &str = if uses_first_sentence_summary(alert) {
-        let first = first_sentence(header);
-        let rest = header[first.len()..].trim_start_matches(['.', ' ']);
-        if rest.is_empty() { header } else { rest }
-    } else {
-        header
-    };
+    let body = alert_body(alert, summary.raw.is_some());
 
     format!("{formatted_summary}{date_part}\n{effect} {body}")
 }
@@ -125,7 +130,6 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use mbtalerts::types::Alert;
 
     fn make_alert(route: &str, effect: &str, start: Option<&str>, end: Option<&str>) -> Alert {
         Alert::builder()
@@ -161,6 +165,51 @@ mod test {
     #[test]
     fn test_format_dt_invalid_passthrough() {
         assert_eq!(format_dt("not-a-date"), "not-a-date");
+    }
+
+    // --- alert_body ---
+
+    #[test]
+    fn test_alert_body_keeps_first_sentence_when_title_is_ai_generated() {
+        // The AI title is unrelated to the first sentence, so stripping it would
+        // delete content that then appears nowhere in the output.
+        let mut alert = make_alert("Red", "SHUTTLE", None, None);
+        alert.attributes.header =
+            "Shuttle buses replace service. Expect delays of 20 minutes.".to_owned();
+
+        assert_eq!(
+            alert_body(&alert, true),
+            "Shuttle buses replace service. Expect delays of 20 minutes."
+        );
+    }
+
+    #[test]
+    fn test_alert_body_strips_first_sentence_when_it_is_the_title() {
+        let mut alert = make_alert("Red", "SHUTTLE", None, None);
+        alert.attributes.header =
+            "Shuttle buses replace service. Expect delays of 20 minutes.".to_owned();
+
+        assert_eq!(alert_body(&alert, false), "Expect delays of 20 minutes.");
+    }
+
+    #[test]
+    fn test_alert_body_keeps_header_when_summary_is_not_the_first_sentence() {
+        let mut alert = make_alert("Red", "DELAY", None, None);
+        alert.attributes.header =
+            "Red Line: Delays of about 20 minutes due to a signal problem.".to_owned();
+
+        assert_eq!(
+            alert_body(&alert, false),
+            "Red Line: Delays of about 20 minutes due to a signal problem."
+        );
+    }
+
+    #[test]
+    fn test_alert_body_keeps_header_when_stripping_would_empty_it() {
+        let mut alert = make_alert("Red", "SHUTTLE", None, None);
+        alert.attributes.header = "Shuttle buses replace service.".to_owned();
+
+        assert_eq!(alert_body(&alert, false), "Shuttle buses replace service.");
     }
 
     // --- format_alert ---
