@@ -150,7 +150,6 @@ impl CalendarClient {
     }
 
     async fn list_alert_events(&self, calendar_id: &str) -> Result<Vec<CalendarEvent>> {
-        let token = self.access_token().await?;
         let mut events = Vec::new();
         let mut page_token: Option<String> = None;
         let time_min = chrono::Utc::now().to_rfc3339();
@@ -158,6 +157,9 @@ impl CalendarClient {
 
         debug!("Listing calendar events for {calendar_id}");
         loop {
+            // Refreshed per page, like send_authenticated: a long pagination can
+            // outlive a token fetched once before the loop.
+            let token = self.access_token().await?;
             let mut req = self.client.get(&events_url).bearer_auth(&token).query(&[
                 ("privateExtendedProperty", "mbta_alert_source=true"),
                 ("timeMin", &time_min),
@@ -268,6 +270,21 @@ fn calendar_ids_for_alert<'a>(alert: &Alert, config: &'a CalendarConfig) -> Vec<
     }
 }
 
+/// Resolves each alert's target calendars once, keyed by alert id.
+///
+/// Doing this per (alert, calendar) pair instead re-runs the route lookup — and
+/// re-fires its "unknown route" / "no route information" warnings — once for
+/// every configured calendar.
+fn calendar_ids_by_alert<'a, 'c>(
+    alerts: &[&'a Alert],
+    config: &'c CalendarConfig,
+) -> HashMap<&'a str, Vec<&'c str>> {
+    alerts
+        .iter()
+        .map(|alert| (alert.id.as_str(), calendar_ids_for_alert(alert, config)))
+        .collect()
+}
+
 pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
     let calendar_ids: HashSet<&str> = match &cal.config {
         CalendarConfig::Single(id) => std::iter::once(id.as_str()).collect(),
@@ -294,11 +311,17 @@ pub async fn sync_alerts(alerts: &Alerts, cal: &CalendarClient) -> Result<()> {
         })
         .collect();
 
+    let ids_by_alert = calendar_ids_by_alert(&sync_alerts, &cal.config);
+
     let tasks = calendar_ids.into_iter().map(|calendar_id| {
         let cal_alerts: Vec<&Alert> = sync_alerts
             .iter()
             .copied()
-            .filter(|a| calendar_ids_for_alert(a, &cal.config).contains(&calendar_id))
+            .filter(|a| {
+                ids_by_alert
+                    .get(a.id.as_str())
+                    .is_some_and(|ids| ids.contains(&calendar_id))
+            })
             .collect();
         async move { sync_calendar(cal, calendar_id, &cal_alerts).await }
     });
@@ -1110,6 +1133,29 @@ mod test {
         let config = per_line_config();
         let alert = make_alert("CR-Fitchburg", "DELAY", None, None);
         assert_eq!(calendar_ids_for_alert(&alert, &config), vec!["cal-default"]);
+    }
+
+    #[test]
+    fn test_calendar_ids_by_alert_resolves_each_alert_once() {
+        // Routing is resolved per alert, not per (alert, calendar) pair — the
+        // per-calendar form re-ran the route lookup and re-fired its warnings
+        // once for every configured calendar.
+        let config = per_line_config();
+        let red = make_alert("Red", "DELAY", None, None);
+        let mut multi = make_alert_multi_route(&["Blue", "Orange"], "SHUTTLE");
+        multi.id = "alert-multi".to_owned();
+        let mut routeless = make_alert_no_route("DELAY");
+        routeless.id = "alert-routeless".to_owned();
+
+        let by_alert = calendar_ids_by_alert(&[&red, &multi, &routeless], &config);
+
+        assert_eq!(by_alert.len(), 3);
+        assert_eq!(by_alert[red.id.as_str()], vec!["cal-red"]);
+        assert_eq!(by_alert[routeless.id.as_str()], vec!["cal-default"]);
+
+        let mut multi_ids = by_alert[multi.id.as_str()].clone();
+        multi_ids.sort();
+        assert_eq!(multi_ids, vec!["cal-blue", "cal-orange"]);
     }
 
     #[test]

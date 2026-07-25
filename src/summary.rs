@@ -9,10 +9,15 @@ pub enum LinePrefixMode {
     Omit,
 }
 
+/// Longest text before a colon still treated as a line prefix. Guards against
+/// stripping a whole sentence that happens to mention "Line" and contain a colon
+/// (the real prefixes are short: "Red Line", "Green Line B, Green Line C").
+const MAX_LINE_PREFIX_LEN: usize = 35;
+
 pub fn strip_line_prefix(header: &str) -> &str {
     if let Some(colon_idx) = header.find(": ") {
         let prefix = &header[..colon_idx];
-        if prefix.contains("Line") && prefix.len() <= 35 {
+        if prefix.contains("Line") && prefix.len() <= MAX_LINE_PREFIX_LEN {
             return header[colon_idx + 2..].trim_start();
         }
     }
