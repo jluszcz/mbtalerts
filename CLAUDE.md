@@ -93,9 +93,8 @@ reproduce a CI-only failure, append `--target aarch64-unknown-linux-musl`.
 ## Deployment
 
 `mbtalerts.tf` provisions the Lambda, which EventBridge invokes on a `rate(3 hours)` schedule. On a push to `main`, CI
-packages the `lambda` binary and uploads `mbtalerts.zip` to the us-east-2 code bucket — it does **not** call
-`update-function-code`; the LambdUpdate watcher picks the object up and updates the function. Terraform is **not** run
-by CI.
+packages the `lambda` binary, uploads `mbtalerts.zip` to the us-east-2 code bucket, and calls `update-function-code`
+itself via the shared `deploy-lambda` workflow. Terraform is **not** run by CI.
 
 The Bedrock IAM policy pins both the foundation model and inference profile ARNs (`mbtalerts.tf:75-80`), so changing
 `BEDROCK_MODEL_ID` requires a matching Terraform change and apply.
