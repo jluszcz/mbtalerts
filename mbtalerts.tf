@@ -128,6 +128,12 @@ data "aws_iam_policy_document" "github" {
     actions   = ["s3:PutObject"]
     resources = ["${data.aws_s3_bucket.code_bucket.arn}/mbtalerts.zip"]
   }
+
+  # GetFunction backs the `aws lambda wait function-updated-v2` in deploy-lambda.yml.
+  statement {
+    actions   = ["lambda:UpdateFunctionCode", "lambda:GetFunction"]
+    resources = [aws_lambda_function.mbtalerts.arn]
+  }
 }
 
 resource "aws_iam_policy" "github_deploy" {
