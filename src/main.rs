@@ -1,7 +1,8 @@
 use chrono::DateTime;
 use clap::Parser;
 use jluszcz_rust_utils::cache::CacheMode;
-use jluszcz_rust_utils::{Verbosity, set_up_logger};
+use jluszcz_rust_utils::cli::VerbosityArgs;
+use jluszcz_rust_utils::{Verbosity, set_up_logger, tls};
 use log::debug;
 use mbtalerts::ai::BedrockSummarizer;
 use mbtalerts::calendar::{CalendarClient, sync_alerts};
@@ -16,9 +17,8 @@ const SEPARATOR: &str = "----------------------------------------";
 #[derive(Debug, Parser)]
 #[command(version, author, infer_long_args = true)]
 struct RawArgs {
-    /// Increase verbosity (-v for debug, -vv for trace; max useful: -vv)
-    #[arg(short = 'v', action = clap::ArgAction::Count)]
-    verbosity: u8,
+    #[command(flatten)]
+    verbosity: VerbosityArgs,
 
     /// Query remote services instead of using cached values.
     #[arg(short = 'n', long)]
@@ -109,7 +109,7 @@ async fn print_alerts(alerts: &Alerts, summarizer: Option<&BedrockSummarizer>) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    tls::install_default_provider();
 
     let args = parse_args();
     set_up_logger(APP_NAME, module_path!(), args.verbosity)?;

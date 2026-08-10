@@ -1,32 +1,22 @@
-use anyhow::{Result, anyhow};
-use aws_sdk_bedrockruntime::config::ProvideCredentials;
-use aws_sdk_bedrockruntime::types::{ContentBlock, ConversationRole, Message};
+//! Bedrock-backed alert summarization: the prompt and the cleanup of the
+//! model's reply, over the shared Converse client.
+
+use anyhow::Result;
+use jluszcz_rust_utils::bedrock::BedrockClient;
 use log::debug;
 
 use crate::summary::strip_line_prefix;
 
-const DEFAULT_MODEL_ID: &str = "us.amazon.nova-2-lite-v1:0";
-
 pub struct BedrockSummarizer {
-    client: aws_sdk_bedrockruntime::Client,
-    model_id: String,
+    client: BedrockClient,
 }
 
 impl BedrockSummarizer {
     /// Returns `None` when AWS credentials are not configured. The CLI runs without
     /// credentials in local use; the Lambda is always credentialed.
     pub async fn from_env() -> Option<Self> {
-        let config = aws_config::from_env().load().await;
-        let provider = config.credentials_provider()?;
-        if let Err(e) = provider.provide_credentials().await {
-            debug!("AWS credentials unavailable; skipping Bedrock summaries: {e}");
-            return None;
-        }
-        let model_id =
-            std::env::var("BEDROCK_MODEL_ID").unwrap_or_else(|_| DEFAULT_MODEL_ID.to_owned());
         Some(Self {
-            client: aws_sdk_bedrockruntime::Client::new(&config),
-            model_id,
+            client: BedrockClient::from_env_if_credentialed().await?,
         })
     }
 
@@ -41,26 +31,7 @@ impl BedrockSummarizer {
              explanation.\n\nAlert: {header}"
         );
 
-        let message = Message::builder()
-            .role(ConversationRole::User)
-            .content(ContentBlock::Text(prompt))
-            .build()?;
-
-        let response = self
-            .client
-            .converse()
-            .model_id(&self.model_id)
-            .messages(message)
-            .send()
-            .await?;
-
-        let text = response
-            .output()
-            .and_then(|o| o.as_message().ok())
-            .and_then(|m| m.content().first())
-            .and_then(|b| b.as_text().ok())
-            .map(|s| strip_line_prefix(s.trim()).to_owned())
-            .ok_or_else(|| anyhow!("Unexpected Bedrock response structure"))?;
+        let text = strip_line_prefix(self.client.generate(&prompt).await?.trim()).to_owned();
 
         debug!("Bedrock summary for {header:?}: {text:?}");
         Ok(text)
