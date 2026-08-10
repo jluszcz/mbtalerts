@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use gcp_auth::{CustomServiceAccount, TokenProvider};
+use jluszcz_rust_utils::query;
 use log::{debug, info, warn};
 use reqwest::{Client, Response};
 use serde::Deserialize;
@@ -27,7 +28,9 @@ pub enum CalendarConfig {
 pub struct CalendarClient {
     token_provider: Arc<dyn TokenProvider>,
     config: CalendarConfig,
-    client: Client,
+    /// The shared client: tuned timeouts, gzip, and a connection pool reused
+    /// across the whole process, rather than a bare `Client::new()`.
+    client: &'static Client,
     summarizer: Option<BedrockSummarizer>,
 }
 
@@ -75,16 +78,6 @@ impl CalendarEvent {
 }
 
 const CALENDAR_ID_SUFFIX: &str = "@group.calendar.google.com";
-
-async fn check_status(response: Response) -> Result<Response> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(response);
-    }
-    let url = response.url().clone();
-    let body = response.text().await.unwrap_or_default();
-    Err(anyhow!("HTTP {status} from {url}: {body}"))
-}
 
 fn normalize_calendar_id(id: String) -> String {
     if id.ends_with(CALENDAR_ID_SUFFIX) {
@@ -134,7 +127,7 @@ impl CalendarClient {
         Ok(Self {
             token_provider,
             config,
-            client: Client::new(),
+            client: query::http_client()?,
             summarizer,
         })
     }
@@ -146,7 +139,7 @@ impl CalendarClient {
 
     async fn send_authenticated(&self, req: reqwest::RequestBuilder) -> Result<Response> {
         let token = self.access_token().await?;
-        check_status(req.bearer_auth(&token).send().await?).await
+        query::send(req.bearer_auth(&token)).await
     }
 
     async fn list_alert_events(&self, calendar_id: &str) -> Result<Vec<CalendarEvent>> {
@@ -169,7 +162,7 @@ impl CalendarClient {
                 req = req.query(&[("pageToken", pt.as_str())]);
             }
 
-            let response: EventList = check_status(req.send().await?).await?.json().await?;
+            let response: EventList = query::send(req).await?.json().await?;
             events.extend(response.items);
 
             match response.next_page_token {
