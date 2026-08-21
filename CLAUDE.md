@@ -103,8 +103,10 @@ reproduce a CI-only failure, append `--target aarch64-unknown-linux-musl`.
 `mbtalerts.tf` provisions the Lambda, which EventBridge invokes on a `rate(3 hours)` schedule. On a push to `main`, CI
 packages the `lambda` binary, uploads `mbtalerts.zip` to the us-east-2 code bucket, and calls `update-function-code`
 itself via the shared `deploy-lambda` workflow. Terraform is **never applied** by CI, but `ci.yml` does call the
-shared `terraform-ci.yml` to run `terraform fmt -check -recursive` and `terraform validate` with
-`-backend=false` — the same checks the `terraform_fmt`/`terraform_validate` pre-commit hooks run locally.
+shared `terraform-ci.yml` to run `terraform fmt -check -recursive`, then `terraform init -backend=false`
+and `terraform validate` — the same checks the `terraform_fmt`/`terraform_validate` pre-commit hooks run locally.
+
+The Terraform check is deliberately absent from `on.push.paths`. That filter gates the *whole* workflow, and `package`/`deploy` are gated only by `if: github.event_name == 'push'` — listing `.tf` there would make a Terraform-only push to `main` deploy the Lambda. The `pull_request` trigger has no path filter, so the check still runs on every PR, which is where it gates.
 
 The Bedrock IAM policy pins both the foundation model and inference profile ARNs (`mbtalerts.tf:75-80`), so changing
 `BEDROCK_MODEL_ID` requires a matching Terraform change and apply.

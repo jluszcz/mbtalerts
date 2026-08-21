@@ -6,9 +6,7 @@ on:
       - main
 
     paths:
-      - '**/*.tf'
       - '.github/workflows/**'
-      - '.terraform.lock.hcl'
       - 'Cargo**'
       - 'src/**/*.rs'
       # tests/fixtures/alerts.json is include_str!'d into the library, so editing
