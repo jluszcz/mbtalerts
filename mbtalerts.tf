@@ -75,8 +75,8 @@ data "aws_iam_policy_document" "bedrock" {
     # Both the foundation model and inference profile ARNs are needed: the profile is what gets invoked,
     # and it in turn routes to the underlying foundation model.
     resources = [
-      "arn:aws:bedrock:*::foundation-model/amazon.nova-2-lite-v1:0",
-      "arn:aws:bedrock:*:*:inference-profile/us.amazon.nova-2-lite-v1:0",
+      "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-5-5",
+      "arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-haiku-5-5",
     ]
   }
 }

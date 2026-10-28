@@ -96,7 +96,7 @@ reproduce a CI-only failure, append `--target aarch64-unknown-linux-musl`.
 | `GOOGLE_SERVICE_ACCOUNT_KEY` | Service account key JSON (required for calendar sync) |
 | `GOOGLE_CALENDAR_ID` | Single target calendar. Used when `GOOGLE_CALENDAR_IDS` is unset |
 | `GOOGLE_CALENDAR_IDS` | JSON mapping line names to calendar IDs; requires a `default` key. Takes precedence |
-| `BEDROCK_MODEL_ID` | Bedrock model for AI titles. Default (`us.amazon.nova-2-lite-v1:0`) comes from rust-utils |
+| `BEDROCK_MODEL_ID` | Bedrock model for AI titles. The default comes from rust-utils |
 
 ## Deployment
 
